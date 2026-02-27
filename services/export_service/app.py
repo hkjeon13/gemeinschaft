@@ -8,15 +8,18 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.export_service.repository import (
     ConversationForExportNotFoundError,
     CreateExportJobInput,
+    DatasetVersionRecord,
+    ExportArtifactNotFoundError,
     ExportJobNotFoundError,
     ExportJobRecord,
     ExportRepository,
+    InvalidExportStorageKeyError,
 )
 from services.shared.app_factory import build_service_app
 
@@ -46,6 +49,18 @@ class ExportJobResponse(BaseModel):
     requested_by_user_id: UUID | None
     created_at: datetime
     completed_at: datetime | None
+
+
+class DatasetVersionResponse(BaseModel):
+    dataset_version_id: UUID
+    conversation_id: UUID
+    version_no: int
+    export_job_id: UUID
+    export_format: str
+    storage_key: str
+    row_count: int
+    manifest: dict[str, Any]
+    created_at: datetime
 
 
 def _connect() -> Any:
@@ -132,3 +147,69 @@ def get_export_job(job_id: UUID) -> ExportJobResponse:
         created_at=result.created_at,
         completed_at=result.completed_at,
     )
+
+
+@app.get("/internal/exports/jobs/{job_id}/download")
+def download_export_job(job_id: UUID) -> Response:
+    connection = _connect()
+    repository = _build_repository(connection)
+    try:
+        record, content = repository.read_export_artifact(job_id)
+    except ExportJobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ExportArtifactNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidExportStorageKeyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    media_type = (
+        "application/x-ndjson"
+        if record.export_format == "jsonl"
+        else "text/csv; charset=utf-8"
+    )
+    filename = f"conversation-{record.conversation_id}.{record.export_format}"
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+@app.get(
+    "/internal/conversations/{conversation_id}/exports/versions",
+    response_model=list[DatasetVersionResponse],
+)
+def list_conversation_dataset_versions(
+    conversation_id: UUID,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[DatasetVersionResponse]:
+    connection = _connect()
+    repository = _build_repository(connection)
+    try:
+        records: list[DatasetVersionRecord] = repository.list_dataset_versions(
+            conversation_id=conversation_id,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    return [
+        DatasetVersionResponse(
+            dataset_version_id=record.dataset_version_id,
+            conversation_id=record.conversation_id,
+            version_no=record.version_no,
+            export_job_id=record.export_job_id,
+            export_format=record.export_format,
+            storage_key=record.storage_key,
+            row_count=record.row_count,
+            manifest=record.manifest,
+            created_at=record.created_at,
+        )
+        for record in records
+    ]

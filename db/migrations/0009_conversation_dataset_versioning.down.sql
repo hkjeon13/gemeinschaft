@@ -1,0 +1,2 @@
+DROP INDEX IF EXISTS idx_conversation_dataset_version_conversation;
+DROP TABLE IF EXISTS conversation_dataset_version;

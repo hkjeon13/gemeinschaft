@@ -114,3 +114,14 @@ def test_v8_schema_contains_export_job_tables() -> None:
     assert "constraint chk_export_job_format check" in sql
     assert "constraint chk_export_job_status check" in sql
     assert "create index idx_export_job_conversation_created" in sql
+
+
+def test_v9_schema_contains_dataset_version_tables() -> None:
+    schema_path = Path("db/migrations/0009_conversation_dataset_versioning.up.sql")
+    sql = schema_path.read_text(encoding="utf-8").lower()
+
+    assert "create table conversation_dataset_version" in sql
+    assert "conversation_id uuid not null references conversation(id)" in sql
+    assert "export_job_id uuid not null references export_job(id)" in sql
+    assert "constraint uq_conversation_dataset_version unique" in sql
+    assert "constraint uq_conversation_dataset_export_job unique" in sql

@@ -10,6 +10,10 @@ from uuid import UUID
 from fastapi import HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from services.conversation_orchestrator.agent_runtime_client import (
+    AgentRuntimeCallError,
+    AgentRuntimeClient,
+)
 from services.conversation_orchestrator.context_packet_builder import (
     ContextPacketBuilder,
     ContextPacketInput,
@@ -37,8 +41,10 @@ from services.conversation_orchestrator.intervention_service import (
     InvalidInterventionTypeError,
 )
 from services.conversation_orchestrator.loop_runner import (
+    AgentRuntimeNotConfiguredError,
     ConversationNotActiveError,
     ConversationLoopRunner,
+    ContextBuilderNotConfiguredError,
     NoParticipantsError,
     RunLoopInput,
     RunLoopResult,
@@ -46,6 +52,14 @@ from services.conversation_orchestrator.loop_runner import (
 from services.conversation_orchestrator.snapshot_projector import (
     ConversationSnapshot,
     SnapshotProjector,
+)
+from services.conversation_orchestrator.turn_approval_service import (
+    ApplyTurnApprovalInput,
+    ApplyTurnApprovalResult,
+    InvalidApprovalDecisionError,
+    TurnApprovalService,
+    TurnApprovalStateError,
+    TurnNotFoundError,
 )
 from services.shared.app_factory import build_service_app
 
@@ -130,16 +144,29 @@ class RunLoopRequest(BaseModel):
     max_turns: int = Field(ge=1, le=100)
     require_citations: bool = False
     required_citation_ids: list[UUID] = Field(default_factory=list, max_length=50)
+    source_document_id: UUID | None = None
+    topic_id: UUID | None = None
+    context_turn_window: int = Field(default=8, ge=1, le=50)
+    context_evidence_limit: int = Field(default=5, ge=1, le=20)
+    use_agent_runtime: bool = False
+    agent_max_output_tokens: int = Field(default=256, ge=1, le=4096)
+    require_human_approval: bool = False
+    max_consecutive_rejections: int = Field(default=3, ge=1, le=20)
+    arbitration_enabled: bool = False
+    pause_on_disagreement: bool = True
 
     model_config = ConfigDict(extra="forbid")
 
 
 class RunLoopResponse(BaseModel):
     conversation_id: UUID
+    turns_attempted: int
     turns_created: int
+    turns_pending_approval: int
     turns_rejected: int
     event_seq_last: int
     turn_index_last: int
+    stop_reason: str | None
     started_at: datetime
     finished_at: datetime
 
@@ -156,6 +183,24 @@ class ApplyInterventionRequest(BaseModel):
 class ApplyInterventionResponse(BaseModel):
     conversation_id: UUID
     status: str
+    event_seq_last: int
+    applied_events: list[str]
+    occurred_at: datetime
+
+
+class TurnApprovalRequest(BaseModel):
+    decision: str = Field(min_length=1)
+    actor_participant_id: UUID | None = None
+    reason: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TurnApprovalResponse(BaseModel):
+    conversation_id: UUID
+    turn_index: int
+    message_status: str
     event_seq_last: int
     applied_events: list[str]
     occurred_at: datetime
@@ -215,11 +260,24 @@ def _build_conversation_start_service(connection: Any) -> ConversationStartServi
 
 
 def _build_loop_runner(connection: Any) -> ConversationLoopRunner:
-    return ConversationLoopRunner(connection)
+    context_builder = ContextPacketBuilder(connection)
+    agent_runtime_base_url = os.getenv("AGENT_RUNTIME_BASE_URL")
+    runtime_client = (
+        AgentRuntimeClient(agent_runtime_base_url) if agent_runtime_base_url else None
+    )
+    return ConversationLoopRunner(
+        connection,
+        context_builder=context_builder,
+        agent_runtime_client=runtime_client,
+    )
 
 
 def _build_intervention_service(connection: Any) -> HumanInterventionService:
     return HumanInterventionService(connection)
+
+
+def _build_turn_approval_service(connection: Any) -> TurnApprovalService:
+    return TurnApprovalService(connection)
 
 
 def _build_context_packet_builder(connection: Any) -> ContextPacketBuilder:
@@ -397,23 +455,44 @@ def run_conversation_loop(
                 max_turns=request.max_turns,
                 require_citations=request.require_citations,
                 required_citation_ids=request.required_citation_ids,
+                source_document_id=request.source_document_id,
+                topic_id=request.topic_id,
+                context_turn_window=request.context_turn_window,
+                context_evidence_limit=request.context_evidence_limit,
+                use_agent_runtime=request.use_agent_runtime,
+                agent_max_output_tokens=request.agent_max_output_tokens,
+                require_human_approval=request.require_human_approval,
+                max_consecutive_rejections=request.max_consecutive_rejections,
+                arbitration_enabled=request.arbitration_enabled,
+                pause_on_disagreement=request.pause_on_disagreement,
             )
         )
     except ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TopicNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except NoParticipantsError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ConversationNotActiveError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ContextBuilderNotConfiguredError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except AgentRuntimeNotConfiguredError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except AgentRuntimeCallError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         connection.close()
 
     return RunLoopResponse(
         conversation_id=result.conversation_id,
+        turns_attempted=result.turns_attempted,
         turns_created=result.turns_created,
+        turns_pending_approval=result.turns_pending_approval,
         turns_rejected=result.turns_rejected,
         event_seq_last=result.event_seq_last,
         turn_index_last=result.turn_index_last,
+        stop_reason=result.stop_reason,
         started_at=result.started_at,
         finished_at=result.finished_at,
     )
@@ -450,6 +529,49 @@ def apply_human_intervention(
     return ApplyInterventionResponse(
         conversation_id=result.conversation_id,
         status=result.status,
+        event_seq_last=result.event_seq_last,
+        applied_events=result.applied_events,
+        occurred_at=result.occurred_at,
+    )
+
+
+@app.post(
+    "/internal/conversations/{conversation_id}/turns/{turn_index}/approval",
+    response_model=TurnApprovalResponse,
+)
+def apply_turn_approval(
+    conversation_id: UUID,
+    turn_index: int,
+    request: TurnApprovalRequest,
+) -> TurnApprovalResponse:
+    connection = _connect()
+    service = _build_turn_approval_service(connection)
+    try:
+        result: ApplyTurnApprovalResult = service.apply_decision(
+            ApplyTurnApprovalInput(
+                conversation_id=conversation_id,
+                turn_index=turn_index,
+                decision=request.decision,
+                actor_participant_id=request.actor_participant_id,
+                reason=request.reason,
+                metadata=request.metadata,
+            )
+        )
+    except ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TurnNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidApprovalDecisionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TurnApprovalStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    return TurnApprovalResponse(
+        conversation_id=result.conversation_id,
+        turn_index=result.turn_index,
+        message_status=result.message_status,
         event_seq_last=result.event_seq_last,
         applied_events=result.applied_events,
         occurred_at=result.occurred_at,

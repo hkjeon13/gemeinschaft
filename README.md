@@ -267,6 +267,99 @@ Behavior:
 - registers lineage manifest in `export_job` (`schema_version`, conversation metadata, row count)
 - supports export formats: `jsonl`, `csv` (current slice)
 
+## Export lineage event append (PR-18)
+
+Export job creation now also appends:
+
+- `event.event_type = export.completed`
+
+Behavior:
+
+- appends `export.completed` at `conversation` next sequence number
+- payload includes `export_job_id`, `format`, `storage_key`, `row_count`, `schema_version`
+- keeps dataset extraction and event lineage synchronized in one transaction
+
+## Export artifact download (PR-19)
+
+Export Service additionally exposes:
+
+- `GET /internal/exports/jobs/{job_id}/download`
+
+Behavior:
+
+- resolves the export artifact from `storage_key`
+- validates artifact path is within configured `EXPORT_STORAGE_DIR`
+- returns downloadable file bytes with attachment header
+
+## Runtime-backed loop generation + context injection (PR-20)
+
+Conversation Orchestrator loop endpoint now supports additional request options:
+
+- `source_document_id`, `topic_id`
+- `context_turn_window`, `context_evidence_limit`
+- `use_agent_runtime`, `agent_max_output_tokens`
+
+Behavior:
+
+- assembles context packet during loop turns when `source_document_id` is provided
+- optionally calls Agent Runtime (`AGENT_RUNTIME_BASE_URL`) for AI participant turn generation
+- stores generation metadata (`generator`, model/tokens/latency) in `message.metadata.generation`
+- uses context evidence chunk IDs as citation allow-list when explicit citation IDs are omitted
+
+## Human approval workflow for AI turns (PR-21)
+
+Conversation Orchestrator adds approval controls:
+
+- `POST /internal/conversations/{conversation_id}/turns/{turn_index}/approval`
+
+Loop behavior update:
+
+- when `require_human_approval=true`, valid AI turns are stored as `message.status=proposed`
+- pending turns emit `turn.pending_approval` instead of immediate `turn.committed`
+
+Approval behavior:
+
+- `decision=approve` -> `turn.approved` + `turn.committed`, message status becomes `committed`
+- `decision=reject` -> `turn.rejected`, message status becomes `rejected`
+
+## Loop guard + disagreement arbitration (PR-22)
+
+Loop request options:
+
+- `max_consecutive_rejections`
+- `arbitration_enabled`
+- `pause_on_disagreement`
+
+Behavior:
+
+- stops early and emits `loop.guard_triggered` when consecutive rejected turns reach threshold
+- emits `turn.arbitration_requested` when consecutive committed AI turns cite disjoint evidence sets
+- can auto-pause conversation on arbitration (`conversation.paused`)
+
+## Dataset version lineage on export (PR-23)
+
+Export flow now records dataset versions:
+
+- new table: `conversation_dataset_version`
+- version is scoped per conversation and auto-increments (`version_no`)
+
+Behavior:
+
+- each successful export registers a version lineage row linked to `export_job`
+- `export_job.manifest` includes `dataset_version_no`
+- `export.completed` event payload includes `dataset_version_no`
+
+## Dataset version listing API (PR-24)
+
+Export Service additionally exposes:
+
+- `GET /internal/conversations/{conversation_id}/exports/versions?limit=20`
+
+Behavior:
+
+- returns dataset versions in descending `version_no`
+- includes `export_job_id`, format, storage key, row count, and manifest lineage fields
+
 ## Repository layout
 
 - `services/`: service app modules
