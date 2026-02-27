@@ -3,10 +3,11 @@ sequenceDiagram
   autonumber
   actor Human
   participant UI as Web App
+  participant Auto as Automation Scheduler
   participant API as API Gateway
   participant Ingest as Data Ingestion
   participant Topic as Topic Pipeline
-  participant TV as Topic Vector Store
+  participant TV as Topic/Vector Store
   participant Orch as Conversation Orchestrator
   participant Mem as Memory Context Service
   participant A1 as AI Agent 1 Runtime
@@ -23,10 +24,18 @@ sequenceDiagram
   Topic->>ES: Emit topic.ready
   API-->>UI: Topics available
 
-  Human->>UI: Start conversation (participants + objectives)
-  UI->>API: Create conversation
-  API->>Orch: Initialize session
-  Orch->>ES: Append conversation.created
+  alt Default mode: periodic automation start
+    Auto->>API: Trigger scheduled run (cron/rrule)
+    API->>Orch: Start conversation from automation template
+    Orch->>ES: Append conversation.created(trigger=automation)
+    Orch->>ES: Append conversation.started(mode=default)
+  else Optional mode: human manual start
+    Human->>UI: Start conversation (participants + objective)
+    UI->>API: Create/Start conversation
+    API->>Orch: Initialize session
+    Orch->>ES: Append conversation.created(trigger=human)
+    Orch->>ES: Append conversation.started(mode=manual)
+  end
 
   loop Turn loop (until terminated)
     opt Human steering or interruption
@@ -68,15 +77,6 @@ sequenceDiagram
         UI->>API: Decision
         API->>Orch: Apply decision
       end
-    end
-
-    opt Persistent agent disagreement
-      Orch->>ES: Append arbitration.started
-      Orch->>A1: Submit claim + evidence
-      Orch->>A2: Submit claim + evidence
-      Orch->>Val: Arbitration check
-      Val-->>Orch: Decision / inconclusive
-      Orch->>ES: Append arbitration.resolved
     end
   end
 
