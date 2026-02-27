@@ -10,6 +10,7 @@ Initial repository scaffold for a multi-agent conversation platform.
 - `data_ingestion` (`DATA_INGESTION_PORT`, default `8003`)
 - `topic_pipeline` (`TOPIC_PIPELINE_PORT`, default `8004`)
 - `export_service` (`EXPORT_SERVICE_PORT`, default `8005`)
+- `scheduler` (`SCHEDULER_PORT`, default `8006`)
 
 Each service currently exposes `GET /healthz` and `GET /readyz`.
 
@@ -129,6 +130,93 @@ Config:
 
 - `EMBEDDING_MODEL` (default `hash-v1`)
 - `EMBEDDING_DIM` (currently fixed to `128` for schema compatibility)
+
+## Topic clustering + topic write (PR-08)
+
+Data Ingestion service additionally exposes:
+
+- `POST /internal/sources/{source_id}/topics`
+
+Behavior:
+
+- loads embedded chunks from `source_chunk` + `source_chunk_embedding`
+- clusters chunk embeddings by cosine similarity threshold
+- writes topics to `topic` and links to `source_chunk_topic`
+- stores clustering failures in `ingestion_dlq`
+
+Config:
+
+- `TOPIC_SIMILARITY_THRESHOLD` (default `0.82`)
+
+## Scheduler + automation template model (PR-09)
+
+Scheduler service exposes:
+
+- `POST /internal/automation/templates`
+- `POST /internal/scheduler/runs/trigger`
+
+Behavior:
+
+- stores periodic automation templates (`automation_template`)
+- triggers automation runs with deterministic idempotency keys
+- duplicate trigger attempts for same schedule slot return `status=duplicate`
+
+## Conversation auto/manual start (PR-10, PR-11)
+
+Conversation Orchestrator additionally exposes:
+
+- `POST /internal/conversations/start/automation`
+- `POST /internal/conversations/start/manual`
+
+Behavior:
+
+- both endpoints use the same internal start path
+- writes `conversation` row with `start_trigger=automation|human`
+- seeds initial events (`conversation.created`, `conversation.started`)
+- automation start supports idempotency by `automation_run_id` (duplicate returns `created=false`)
+
+## Orchestrator loop v1 (PR-12)
+
+Conversation Orchestrator additionally exposes:
+
+- `POST /internal/conversations/{conversation_id}/loop/run`
+
+Behavior:
+
+- deterministic round-robin turn creation over conversation participants
+- commits `message` + `turn.committed` event pairs
+- enforces `max_turns` cap per request
+
+## Agent runtime wrapper (PR-13)
+
+Agent Runtime service additionally exposes:
+
+- `POST /internal/agents/run`
+
+Behavior:
+
+- supports agent profiles (`ai_1`, `ai_2`)
+- routes to model by env config with optional request override
+- returns normalized runtime output payload (`selected_model`, token estimates, latency)
+
+Config:
+
+- `AGENT_AI_1_MODEL`
+- `AGENT_AI_2_MODEL`
+- `AGENT_DEFAULT_MODEL`
+
+## Context packet assembler (PR-14)
+
+Conversation Orchestrator additionally exposes:
+
+- `POST /internal/conversations/{conversation_id}/context/assemble`
+
+Behavior:
+
+- selects topic (`topic_id` 지정 시 해당 토픽, 없으면 source 기준 대표 토픽)
+- assembles recent turns from conversation history
+- assembles top evidence chunks from `source_chunk_topic`
+- returns a deterministic context packet for downstream agent turn generation
 
 ## Repository layout
 

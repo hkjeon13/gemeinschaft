@@ -34,6 +34,7 @@ SERVICES: tuple[ServiceSpec, ...] = (
     ServiceSpec("data_ingestion", "services.data_ingestion.app", "DATA_INGESTION_PORT", 8003),
     ServiceSpec("topic_pipeline", "services.topic_pipeline.app", "TOPIC_PIPELINE_PORT", 8004),
     ServiceSpec("export_service", "services.export_service.app", "EXPORT_SERVICE_PORT", 8005),
+    ServiceSpec("scheduler", "services.scheduler.app", "SCHEDULER_PORT", 8006),
 )
 
 

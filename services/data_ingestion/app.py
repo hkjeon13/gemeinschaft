@@ -27,6 +27,7 @@ from services.data_ingestion.source_repository import (
     CreateSourceResult,
     SourceRepository,
 )
+from services.data_ingestion.topic_worker import TopicSourceResult, TopicWorker
 from services.shared.app_factory import build_service_app
 
 app = build_service_app("data_ingestion")
@@ -56,6 +57,16 @@ class EmbedSourceResponse(BaseModel):
     status: str
     chunk_count: int
     embedding_count: int
+    dlq_id: int | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+class ClusterTopicsResponse(BaseModel):
+    source_id: UUID
+    status: str
+    topic_count: int
+    link_count: int
     dlq_id: int | None = None
     error_type: str | None = None
     error_message: str | None = None
@@ -111,6 +122,31 @@ def _build_embedding_worker(*, connection: Any) -> EmbeddingWorker:
     repository = IngestionProcessingRepository(connection)
     return EmbeddingWorker(
         repository=repository,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
+    )
+
+
+def _build_topic_worker(*, connection: Any) -> TopicWorker:
+    similarity_threshold = float(os.getenv("TOPIC_SIMILARITY_THRESHOLD", "0.82"))
+    if not 0.0 <= similarity_threshold <= 1.0:
+        raise HTTPException(
+            status_code=500,
+            detail="TOPIC_SIMILARITY_THRESHOLD must be between 0.0 and 1.0",
+        )
+
+    embedding_model = os.getenv("EMBEDDING_MODEL", "hash-v1")
+    embedding_dim = int(os.getenv("EMBEDDING_DIM", "128"))
+    if embedding_dim != 128:
+        raise HTTPException(
+            status_code=500,
+            detail="EMBEDDING_DIM must be 128 for current topic/embedding schema",
+        )
+
+    repository = IngestionProcessingRepository(connection)
+    return TopicWorker(
+        repository=repository,
+        similarity_threshold=similarity_threshold,
         embedding_model=embedding_model,
         embedding_dim=embedding_dim,
     )
@@ -248,6 +284,28 @@ def embed_source(source_id: UUID) -> EmbedSourceResponse:
         status=result.status,
         chunk_count=result.chunk_count,
         embedding_count=result.embedding_count,
+        dlq_id=result.dlq_id,
+        error_type=result.error_type,
+        error_message=result.error_message,
+    )
+
+
+@app.post("/internal/sources/{source_id}/topics", response_model=ClusterTopicsResponse)
+def cluster_source_topics(source_id: UUID) -> ClusterTopicsResponse:
+    connection = _connect()
+    try:
+        worker = _build_topic_worker(connection=connection)
+        result: TopicSourceResult = worker.cluster_source(source_id)
+    except SourceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    return ClusterTopicsResponse(
+        source_id=result.source_id,
+        status=result.status,
+        topic_count=result.topic_count,
+        link_count=result.link_count,
         dlq_id=result.dlq_id,
         error_type=result.error_type,
         error_message=result.error_message,

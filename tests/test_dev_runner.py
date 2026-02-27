@@ -6,7 +6,7 @@ from scripts.dev import SERVICES, ServiceSpec, build_command
 def test_service_specs_are_unique() -> None:
     names = [spec.name for spec in SERVICES]
     ports = [spec.default_port for spec in SERVICES]
-    assert len(names) == 6
+    assert len(names) == 7
     assert len(set(names)) == len(names)
     assert len(set(ports)) == len(ports)
 

@@ -9,6 +9,7 @@ from services.api_gateway.app import app as api_gateway_app
 from services.conversation_orchestrator.app import app as orchestrator_app
 from services.data_ingestion.app import app as data_ingestion_app
 from services.export_service.app import app as export_service_app
+from services.scheduler.app import app as scheduler_app
 from services.topic_pipeline.app import app as topic_pipeline_app
 
 SERVICE_APPS: list[tuple[str, FastAPI]] = [
@@ -18,6 +19,7 @@ SERVICE_APPS: list[tuple[str, FastAPI]] = [
     ("data_ingestion", data_ingestion_app),
     ("topic_pipeline", topic_pipeline_app),
     ("export_service", export_service_app),
+    ("scheduler", scheduler_app),
 ]
 
 

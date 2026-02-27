@@ -81,3 +81,25 @@ def test_v5_schema_contains_pgvector_embedding_table() -> None:
     assert "embedding vector(128) not null" in sql
     assert "constraint uq_source_chunk_embedding unique (source_chunk_id)" in sql
     assert "using ivfflat (embedding vector_cosine_ops)" in sql
+
+
+def test_v6_schema_contains_topic_and_mapping_tables() -> None:
+    schema_path = Path("db/migrations/0006_topic_clustering_and_mapping.up.sql")
+    sql = schema_path.read_text(encoding="utf-8").lower()
+
+    assert "create table topic" in sql
+    assert "create table source_chunk_topic" in sql
+    assert "centroid vector(128) not null" in sql
+    assert "constraint uq_topic_cluster_key unique (source_document_id, cluster_key)" in sql
+    assert "constraint chk_source_chunk_topic_link_type check" in sql
+
+
+def test_v7_schema_contains_scheduler_tables() -> None:
+    schema_path = Path("db/migrations/0007_scheduler_automation_templates.up.sql")
+    sql = schema_path.read_text(encoding="utf-8").lower()
+
+    assert "create table automation_template" in sql
+    assert "create table automation_run" in sql
+    assert "constraint uq_automation_template_name unique" in sql
+    assert "constraint uq_automation_run_idempotency unique" in sql
+    assert "constraint chk_automation_run_status check" in sql
