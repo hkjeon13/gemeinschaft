@@ -29,7 +29,15 @@ from services.conversation_orchestrator.event_store import (
     EventStore,
     SequenceConflictError,
 )
+from services.conversation_orchestrator.intervention_service import (
+    ApplyInterventionInput,
+    ApplyInterventionResult,
+    HumanInterventionService,
+    InvalidInterventionStateError,
+    InvalidInterventionTypeError,
+)
 from services.conversation_orchestrator.loop_runner import (
+    ConversationNotActiveError,
     ConversationLoopRunner,
     NoParticipantsError,
     RunLoopInput,
@@ -136,6 +144,23 @@ class RunLoopResponse(BaseModel):
     finished_at: datetime
 
 
+class ApplyInterventionRequest(BaseModel):
+    intervention_type: str = Field(min_length=1)
+    actor_participant_id: UUID | None = None
+    instruction: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ApplyInterventionResponse(BaseModel):
+    conversation_id: UUID
+    status: str
+    event_seq_last: int
+    applied_events: list[str]
+    occurred_at: datetime
+
+
 class AssembleContextRequest(BaseModel):
     source_document_id: UUID
     topic_id: UUID | None = None
@@ -191,6 +216,10 @@ def _build_conversation_start_service(connection: Any) -> ConversationStartServi
 
 def _build_loop_runner(connection: Any) -> ConversationLoopRunner:
     return ConversationLoopRunner(connection)
+
+
+def _build_intervention_service(connection: Any) -> HumanInterventionService:
+    return HumanInterventionService(connection)
 
 
 def _build_context_packet_builder(connection: Any) -> ContextPacketBuilder:
@@ -374,6 +403,8 @@ def run_conversation_loop(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except NoParticipantsError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ConversationNotActiveError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     finally:
         connection.close()
 
@@ -385,6 +416,43 @@ def run_conversation_loop(
         turn_index_last=result.turn_index_last,
         started_at=result.started_at,
         finished_at=result.finished_at,
+    )
+
+
+@app.post(
+    "/internal/conversations/{conversation_id}/interventions/apply",
+    response_model=ApplyInterventionResponse,
+)
+def apply_human_intervention(
+    conversation_id: UUID, request: ApplyInterventionRequest
+) -> ApplyInterventionResponse:
+    connection = _connect()
+    service = _build_intervention_service(connection)
+    try:
+        result: ApplyInterventionResult = service.apply_intervention(
+            ApplyInterventionInput(
+                conversation_id=conversation_id,
+                intervention_type=request.intervention_type,
+                actor_participant_id=request.actor_participant_id,
+                instruction=request.instruction,
+                metadata=request.metadata,
+            )
+        )
+    except ConversationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except InvalidInterventionTypeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except InvalidInterventionStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    return ApplyInterventionResponse(
+        conversation_id=result.conversation_id,
+        status=result.status,
+        event_seq_last=result.event_seq_last,
+        applied_events=result.applied_events,
+        occurred_at=result.occurred_at,
     )
 
 

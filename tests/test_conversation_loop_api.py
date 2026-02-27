@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from services.conversation_orchestrator import app as orchestrator_app_module
 from services.conversation_orchestrator.event_store import ConversationNotFoundError
 from services.conversation_orchestrator.loop_runner import (
+    ConversationNotActiveError,
     NoParticipantsError,
     RunLoopResult,
 )
@@ -45,6 +46,13 @@ class NotFoundLoopRunner:
 class NoParticipantsLoopRunner:
     def run_loop(self, payload: Any) -> RunLoopResult:
         raise NoParticipantsError(f"Conversation {payload.conversation_id} has no participants")
+
+
+class NotActiveLoopRunner:
+    def run_loop(self, payload: Any) -> RunLoopResult:
+        raise ConversationNotActiveError(
+            f"Conversation {payload.conversation_id} is not active (status=paused)"
+        )
 
 
 def test_run_loop_endpoint_success(monkeypatch: Any) -> None:
@@ -104,3 +112,21 @@ def test_run_loop_endpoint_no_participants(monkeypatch: Any) -> None:
     )
 
     assert response.status_code == 400
+
+
+def test_run_loop_endpoint_non_active(monkeypatch: Any) -> None:
+    monkeypatch.setattr(orchestrator_app_module, "_connect", lambda: DummyConnection())
+    monkeypatch.setattr(
+        orchestrator_app_module,
+        "_build_loop_runner",
+        lambda connection: NotActiveLoopRunner(),
+    )
+    client = TestClient(orchestrator_app_module.app)
+    conversation_id = str(uuid4())
+
+    response = client.post(
+        f"/internal/conversations/{conversation_id}/loop/run",
+        json={"max_turns": 2},
+    )
+
+    assert response.status_code == 409

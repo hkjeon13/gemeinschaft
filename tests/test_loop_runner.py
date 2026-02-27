@@ -9,6 +9,7 @@ import pytest
 
 from services.conversation_orchestrator.event_store import ConversationNotFoundError
 from services.conversation_orchestrator.loop_runner import (
+    ConversationNotActiveError,
     ConversationLoopRunner,
     NoParticipantsError,
     RunLoopInput,
@@ -20,12 +21,14 @@ class FakeConnection:
         self,
         *,
         conversation_exists: bool,
+        conversation_status: str = "active",
         participants: list[tuple[Any, str, str]],
         initial_turn_index: int = 0,
         initial_seq_no: int = 0,
         recent_turn_texts: list[str] | None = None,
     ):
         self.conversation_exists = conversation_exists
+        self.conversation_status = conversation_status
         self.participants = participants
         self.initial_turn_index = initial_turn_index
         self.initial_seq_no = initial_seq_no
@@ -53,8 +56,10 @@ class FakeConnection:
 
     def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
         normalized_sql = " ".join(sql.lower().split())
-        if "select id from conversation where id" in normalized_sql:
-            self._last_fetchone = ("conversation",) if self.conversation_exists else None
+        if "select id, status from conversation where id" in normalized_sql:
+            self._last_fetchone = (
+                ("conversation", self.conversation_status) if self.conversation_exists else None
+            )
             return
         if "select id, kind, display_name from participant" in normalized_sql:
             self._last_fetchall = self.participants
@@ -199,6 +204,22 @@ def test_loop_runner_rejects_missing_conversation() -> None:
     runner = ConversationLoopRunner(connection)
 
     with pytest.raises(ConversationNotFoundError):
+        runner.run_loop(RunLoopInput(conversation_id=uuid4(), max_turns=1))
+
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 1
+
+
+def test_loop_runner_rejects_non_active_conversation() -> None:
+    participant_a = (uuid4(), "ai", "AI(1)")
+    connection = FakeConnection(
+        conversation_exists=True,
+        conversation_status="paused",
+        participants=[participant_a],
+    )
+    runner = ConversationLoopRunner(connection)
+
+    with pytest.raises(ConversationNotActiveError):
         runner.run_loop(RunLoopInput(conversation_id=uuid4(), max_turns=1))
 
     assert connection.commit_calls == 0

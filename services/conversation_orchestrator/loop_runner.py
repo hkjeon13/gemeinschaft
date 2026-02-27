@@ -19,6 +19,10 @@ class NoParticipantsError(RuntimeError):
     """Raised when a conversation has no participants to run turns for."""
 
 
+class ConversationNotActiveError(RuntimeError):
+    """Raised when loop run is requested for non-active conversation."""
+
+
 @dataclass(frozen=True)
 class ParticipantRecord:
     id: UUID
@@ -64,16 +68,22 @@ class ConversationLoopRunner:
             with self._connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id
+                    SELECT id, status
                     FROM conversation
                     WHERE id = %s
                     FOR UPDATE
                     """,
                     (str(payload.conversation_id),),
                 )
-                if cursor.fetchone() is None:
+                conversation_row = cursor.fetchone()
+                if conversation_row is None:
                     raise ConversationNotFoundError(
                         f"Conversation {payload.conversation_id} not found"
+                    )
+                if conversation_row[1] != "active":
+                    raise ConversationNotActiveError(
+                        f"Conversation {payload.conversation_id} is not active "
+                        f"(status={conversation_row[1]})"
                     )
 
                 cursor.execute(

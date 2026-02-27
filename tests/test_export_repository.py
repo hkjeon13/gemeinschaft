@@ -1,0 +1,272 @@
+"""Unit tests for export repository."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pytest
+
+from services.export_service.repository import (
+    ConversationForExportNotFoundError,
+    CreateExportJobInput,
+    ExportJobNotFoundError,
+    ExportRepository,
+)
+
+
+class FakeConnection:
+    def __init__(
+        self,
+        *,
+        conversation_row: tuple[Any, ...] | None,
+        message_rows: list[tuple[Any, ...]],
+        export_job_row: tuple[Any, ...] | None = None,
+    ):
+        self.conversation_row = conversation_row
+        self.message_rows = message_rows
+        self.export_job_row = export_job_row
+        self.commit_calls = 0
+        self.rollback_calls = 0
+        self._last_fetchone: Any = None
+        self._last_fetchall: list[Any] = []
+        self.inserted_storage_key: str | None = None
+        self.inserted_manifest: dict[str, Any] | None = None
+
+    def cursor(self) -> "FakeConnection":
+        return self
+
+    def __enter__(self) -> "FakeConnection":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        normalized_sql = " ".join(sql.lower().split())
+        if (
+            "from conversation where id = %s and tenant_id = %s and workspace_id = %s"
+        ) in normalized_sql:
+            self._last_fetchone = self.conversation_row
+            return
+        if "from message m join participant p" in normalized_sql:
+            self._last_fetchall = self.message_rows
+            return
+        if "insert into export_job" in normalized_sql:
+            assert params is not None
+            self.inserted_storage_key = str(params[5])
+            self.inserted_manifest = json.loads(str(params[7]))
+            self._last_fetchone = self.export_job_row
+            return
+        if "from export_job where id = %s" in normalized_sql:
+            self._last_fetchone = self.export_job_row
+            return
+        raise AssertionError(f"Unexpected SQL in fake: {normalized_sql}")
+
+    def fetchone(self) -> Any:
+        return self._last_fetchone
+
+    def fetchall(self) -> Any:
+        return self._last_fetchall
+
+    def commit(self) -> None:
+        self.commit_calls += 1
+
+    def rollback(self) -> None:
+        self.rollback_calls += 1
+
+
+def _conversation_row(conversation_id: Any) -> tuple[Any, ...]:
+    ts = datetime(2026, 2, 27, 21, 30, tzinfo=timezone.utc)
+    return (
+        conversation_id,
+        "Refund triage",
+        "Analyze refund anomalies",
+        "automation",
+        "active",
+        ts,
+        ts,
+        None,
+    )
+
+
+def _message_rows() -> list[tuple[Any, ...]]:
+    ts = datetime(2026, 2, 27, 21, 31, tzinfo=timezone.utc)
+    return [
+        (
+            uuid4(),
+            1,
+            "statement",
+            "committed",
+            "hello",
+            ts,
+            uuid4(),
+            "ai",
+            "AI(1)",
+            "analyst",
+        ),
+        (
+            uuid4(),
+            2,
+            "statement",
+            "committed",
+            "world",
+            ts,
+            uuid4(),
+            "human",
+            "Reviewer",
+            "owner",
+        ),
+    ]
+
+
+def test_create_export_job_jsonl_writes_file(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    tenant_id = uuid4()
+    workspace_id = uuid4()
+    export_job_id = uuid4()
+    ts = datetime(2026, 2, 27, 21, 32, tzinfo=timezone.utc)
+    connection = FakeConnection(
+        conversation_row=_conversation_row(conversation_id),
+        message_rows=_message_rows(),
+        export_job_row=(export_job_id, "completed", ts, ts),
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    result = repository.create_export_job(
+        CreateExportJobInput(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            export_format="jsonl",
+            requested_by_user_id=None,
+        )
+    )
+
+    assert result.job_id == export_job_id
+    assert result.row_count == 2
+    assert result.status == "completed"
+    assert connection.commit_calls == 1
+    assert connection.rollback_calls == 0
+    export_path = Path(result.storage_key)
+    assert export_path.exists()
+    lines = export_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["turn_index"] == 1
+
+
+def test_create_export_job_csv_writes_header_for_empty_rows(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    export_job_id = uuid4()
+    ts = datetime(2026, 2, 27, 21, 35, tzinfo=timezone.utc)
+    connection = FakeConnection(
+        conversation_row=_conversation_row(conversation_id),
+        message_rows=[],
+        export_job_row=(export_job_id, "completed", ts, ts),
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    result = repository.create_export_job(
+        CreateExportJobInput(
+            tenant_id=uuid4(),
+            workspace_id=uuid4(),
+            conversation_id=conversation_id,
+            export_format="csv",
+            requested_by_user_id=None,
+        )
+    )
+
+    assert result.row_count == 0
+    content = Path(result.storage_key).read_text(encoding="utf-8")
+    assert content.startswith("message_id,turn_index")
+
+
+def test_create_export_job_rejects_invalid_format(tmp_path: Path) -> None:
+    connection = FakeConnection(
+        conversation_row=_conversation_row(uuid4()),
+        message_rows=[],
+        export_job_row=None,
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    with pytest.raises(ValueError):
+        repository.create_export_job(
+            CreateExportJobInput(
+                tenant_id=uuid4(),
+                workspace_id=uuid4(),
+                conversation_id=uuid4(),
+                export_format="parquet",
+                requested_by_user_id=None,
+            )
+        )
+
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 0
+
+
+def test_create_export_job_raises_when_conversation_missing(tmp_path: Path) -> None:
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=None,
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    with pytest.raises(ConversationForExportNotFoundError):
+        repository.create_export_job(
+            CreateExportJobInput(
+                tenant_id=uuid4(),
+                workspace_id=uuid4(),
+                conversation_id=uuid4(),
+                export_format="jsonl",
+                requested_by_user_id=None,
+            )
+        )
+
+    assert connection.commit_calls == 0
+    assert connection.rollback_calls == 1
+
+
+def test_get_export_job_returns_record(tmp_path: Path) -> None:
+    job_id = uuid4()
+    ts = datetime(2026, 2, 27, 21, 40, tzinfo=timezone.utc)
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=(
+            job_id,
+            uuid4(),
+            uuid4(),
+            uuid4(),
+            "jsonl",
+            "completed",
+            str(tmp_path / "out.jsonl"),
+            2,
+            {"schema_version": "dataset.v1"},
+            None,
+            ts,
+            ts,
+        ),
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    result = repository.get_export_job(job_id)
+
+    assert result.job_id == job_id
+    assert result.status == "completed"
+    assert result.row_count == 2
+
+
+def test_get_export_job_raises_when_missing(tmp_path: Path) -> None:
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=None,
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    with pytest.raises(ExportJobNotFoundError):
+        repository.get_export_job(uuid4())

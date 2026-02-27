@@ -218,6 +218,55 @@ Behavior:
 - assembles top evidence chunks from `source_chunk_topic`
 - returns a deterministic context packet for downstream agent turn generation
 
+## Validation guard + rejected turns (PR-15)
+
+Conversation Orchestrator loop endpoint now supports:
+
+- `POST /internal/conversations/{conversation_id}/loop/run`
+  - new request options:
+    - `require_citations` (default `false`)
+    - `required_citation_ids` (optional allow-list)
+
+Behavior:
+
+- validates each proposed turn before commit (empty text, repetition loop risk, citation rules)
+- writes `turn.committed` for valid turns and `turn.rejected` for invalid turns
+- stores validation details in `message.metadata.validation`
+- auto-pauses conversation when all turns in the loop run are rejected
+
+## Human intervention controls (PR-16)
+
+Conversation Orchestrator additionally exposes:
+
+- `POST /internal/conversations/{conversation_id}/interventions/apply`
+
+Intervention types:
+
+- `interrupt` -> append `human.intervention` + `conversation.paused`
+- `resume` -> append `human.intervention` + `conversation.resumed`
+- `terminate` -> append `human.intervention` + `conversation.terminated`
+- `steer` -> append `human.intervention` only
+
+Loop behavior:
+
+- loop run is blocked for non-`active` conversations (`409`)
+- human interventions now become first-class state transitions in event history
+
+## Export jobs + dataset extraction (PR-17)
+
+Export Service now exposes:
+
+- `POST /internal/exports/jobs`
+- `GET /internal/exports/jobs/{job_id}`
+
+Behavior:
+
+- validates conversation ownership (`tenant_id`, `workspace_id`, `conversation_id`)
+- extracts ordered conversation rows (message + participant metadata)
+- serializes dataset to local export storage (`EXPORT_STORAGE_DIR`)
+- registers lineage manifest in `export_job` (`schema_version`, conversation metadata, row count)
+- supports export formats: `jsonl`, `csv` (current slice)
+
 ## Repository layout
 
 - `services/`: service app modules

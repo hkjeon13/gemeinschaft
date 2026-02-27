@@ -103,3 +103,14 @@ def test_v7_schema_contains_scheduler_tables() -> None:
     assert "constraint uq_automation_template_name unique" in sql
     assert "constraint uq_automation_run_idempotency unique" in sql
     assert "constraint chk_automation_run_status check" in sql
+
+
+def test_v8_schema_contains_export_job_tables() -> None:
+    schema_path = Path("db/migrations/0008_export_jobs_and_lineage.up.sql")
+    sql = schema_path.read_text(encoding="utf-8").lower()
+
+    assert "create table export_job" in sql
+    assert "conversation_id uuid not null references conversation(id)" in sql
+    assert "constraint chk_export_job_format check" in sql
+    assert "constraint chk_export_job_status check" in sql
+    assert "create index idx_export_job_conversation_created" in sql
