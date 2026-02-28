@@ -121,6 +121,14 @@ docker compose up --build -d
 
 `migrate` 서비스가 먼저 실행되어 DB 마이그레이션을 적용한 뒤 앱 서비스들이 올라옵니다.
 
+변수화된 주요 값(`.env`로 제어):
+
+- `COMPOSE_DATABASE_URL`, `COMPOSE_POSTGRES_USER`, `COMPOSE_POSTGRES_PASSWORD`, `COMPOSE_POSTGRES_DB`, `COMPOSE_POSTGRES_PORT`
+- `COMPOSE_SERVICE_HOST`
+- `COMPOSE_OBJECT_STORAGE_PROVIDER`, `COMPOSE_OBJECT_STORAGE_ROOT`, `COMPOSE_EXPORT_STORAGE_DIR`
+- `COMPOSE_AGENT_RUNTIME_BASE_URL`, `COMPOSE_CONVERSATION_ORCHESTRATOR_BASE_URL`
+- `*_PORT` (`API_GATEWAY_PORT`, `CONVERSATION_ORCHESTRATOR_PORT`, ...)
+
 ### 3) 상태 확인
 
 ```bash
@@ -168,11 +176,23 @@ docker compose run --rm migrate python scripts/migrate.py up
 - 저장소 경로
   - `OBJECT_STORAGE_ROOT`
   - `EXPORT_STORAGE_DIR`
+- LLM 런타임
+  - `AGENT_RUNTIME_PROVIDER` (`stub|openai|anthropic|google`)
+  - `AGENT_AI_1_PROVIDER`, `AGENT_AI_2_PROVIDER`, `AGENT_DEFAULT_PROVIDER`
+    (`stub|openai|anthropic|google`)
+  - `AGENT_RUNTIME_TIMEOUT_SECONDS`
+  - `OPENAI_API_KEY`, `OPENAI_BASE_URL`
+  - `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_VERSION`
+  - `GOOGLE_API_KEY`, `GOOGLE_BASE_URL`
 - 보안/인증
   - `INTERNAL_API_TOKEN` (설정 시 non-health 내부 API는 `x-internal-api-token` 필요)
   - `x-internal-role`, `x-auth-tenant-id`, `x-auth-workspace-id` 헤더로 역할/스코프 제어
 
 세부값은 `.env.example`를 참고하세요.
+
+`/internal/agents/run`의 `requested_model`은 `provider:model` 형식도 지원합니다.
+예: `openai:gpt-4.1-mini`, `anthropic:claude-3-7-sonnet-latest`,
+`google:gemini-2.0-flash`.
 
 ## API 탐색
 

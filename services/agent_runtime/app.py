@@ -12,6 +12,8 @@ from services.agent_runtime.runtime import (
     ModelRouter,
     RunAgentInput,
     RunAgentResult,
+    RuntimeProviderConfigError,
+    RuntimeProviderError,
     UnknownAgentError,
 )
 from services.shared.app_factory import build_service_app
@@ -72,6 +74,10 @@ def run_agent(request: RunAgentRequest, http_request: Request) -> RunAgentRespon
         )
     except UnknownAgentError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeProviderConfigError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except RuntimeProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     return RunAgentResponse(
         run_id=str(result.run_id),
