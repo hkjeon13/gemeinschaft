@@ -1,4 +1,5 @@
 import { exportJWK, generateKeyPair, importJWK, SignJWT } from "jose";
+import type { JWK, KeyLike } from "jose";
 
 export class ApiError extends Error {
   status: number;
@@ -23,7 +24,10 @@ export function clearClientSecurityContext(): void {
 }
 
 let refreshInFlight: Promise<boolean> | null = null;
-let dpopStatePromise: Promise<{ privateKey: CryptoKey; publicJwk: JsonWebKey }> | null = null;
+type DpopPublicJwk = Pick<JWK, "kty" | "crv" | "x" | "y">;
+type DpopPrivateKey = KeyLike | Uint8Array;
+type DpopState = { privateKey: DpopPrivateKey; publicJwk: DpopPublicJwk };
+let dpopStatePromise: Promise<DpopState> | null = null;
 
 const DPOP_PRIVATE_JWK_STORAGE_KEY = "dpop_private_jwk";
 const DPOP_PUBLIC_JWK_STORAGE_KEY = "dpop_public_jwk";
@@ -43,7 +47,25 @@ function shouldSendCsrf(method: string): boolean {
   return !["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase());
 }
 
-async function getDpopState(): Promise<{ privateKey: CryptoKey; publicJwk: JsonWebKey }> {
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isJwk(value: unknown): value is JWK {
+  if (!isObject(value)) {
+    return false;
+  }
+  return typeof value.kty === "string";
+}
+
+function isDpopPublicJwk(value: unknown): value is DpopPublicJwk {
+  if (!isObject(value)) {
+    return false;
+  }
+  return value.kty === "EC" && value.crv === "P-256" && typeof value.x === "string" && typeof value.y === "string";
+}
+
+async function getDpopState(): Promise<DpopState> {
   if (dpopStatePromise) {
     return dpopStatePromise;
   }
@@ -52,21 +74,31 @@ async function getDpopState(): Promise<{ privateKey: CryptoKey; publicJwk: JsonW
     const storedPrivate = sessionStorage.getItem(DPOP_PRIVATE_JWK_STORAGE_KEY);
     const storedPublic = sessionStorage.getItem(DPOP_PUBLIC_JWK_STORAGE_KEY);
     if (storedPrivate && storedPublic) {
-      const privateJwk = JSON.parse(storedPrivate) as JsonWebKey;
-      const publicJwk = JSON.parse(storedPublic) as JsonWebKey;
-      const privateKey = await importJWK(privateJwk, "ES256");
-      return { privateKey, publicJwk };
+      const privateJwk = JSON.parse(storedPrivate) as unknown;
+      const publicJwk = JSON.parse(storedPublic) as unknown;
+      if (isJwk(privateJwk) && isDpopPublicJwk(publicJwk)) {
+        const privateKey = await importJWK(privateJwk, "ES256");
+        return { privateKey, publicJwk };
+      }
+      clearClientSecurityContext();
     }
 
     const pair = await generateKeyPair("ES256", { extractable: true });
     const privateJwk = await exportJWK(pair.privateKey);
-    const publicJwk = (await exportJWK(pair.publicKey)) as JsonWebKey;
+    const publicJwk = await exportJWK(pair.publicKey);
+    if (!isJwk(privateJwk) || !isDpopPublicJwk(publicJwk)) {
+      throw new Error("Failed to generate valid DPoP JWK.");
+    }
     sessionStorage.setItem(DPOP_PRIVATE_JWK_STORAGE_KEY, JSON.stringify(privateJwk));
     sessionStorage.setItem(DPOP_PUBLIC_JWK_STORAGE_KEY, JSON.stringify(publicJwk));
     return { privateKey: pair.privateKey, publicJwk };
   })();
 
-  return dpopStatePromise;
+  const statePromise = dpopStatePromise;
+  if (!statePromise) {
+    throw new Error("Failed to initialize DPoP state.");
+  }
+  return statePromise;
 }
 
 async function createDpopProof(path: string, method: string): Promise<string> {
