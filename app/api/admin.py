@@ -32,12 +32,16 @@ def _model_schema(item) -> AdminChatModelSchema:
     return AdminChatModelSchema(
         model_id=item.model_id,
         provider=item.provider,
-        client_type=item.client_type,
+        openai_api=item.openai_api,
         model=item.model,
         display_name=item.display_name,
         description=item.description,
         parameters=item.parameters,
+        client_options=item.client_options,
+        chat_create_options=item.chat_create_options,
+        responses_create_options=item.responses_create_options,
         has_api_key=item.has_api_key,
+        has_webhook_secret=item.has_webhook_secret,
         is_active=item.is_active,
         is_default=item.is_default,
         created_at=item.created_at,
@@ -130,12 +134,16 @@ async def admin_create_model(payload: AdminChatModelCreateSchema, access: Access
     created = create_chat_model(
         model_id=payload.model_id,
         provider=payload.provider,
-        client_type=payload.client_type,
+        openai_api=payload.openai_api,
         model=payload.model,
         display_name=payload.display_name,
         description=payload.description,
         parameters=payload.parameters,
+        client_options=payload.client_options,
+        chat_create_options=payload.chat_create_options,
+        responses_create_options=payload.responses_create_options,
         api_key=payload.api_key,
+        webhook_secret=payload.webhook_secret,
         is_active=payload.is_active,
         is_default=payload.is_default,
     )
@@ -151,13 +159,18 @@ async def admin_update_model(
     authorize_action(access, action="admin:model:update")
     if (
         payload.provider is None
-        and payload.client_type is None
+        and payload.openai_api is None
         and payload.model is None
         and payload.display_name is None
         and payload.description is None
         and payload.parameters is None
+        and payload.client_options is None
+        and payload.chat_create_options is None
+        and payload.responses_create_options is None
         and payload.api_key is None
         and payload.clear_api_key is None
+        and payload.webhook_secret is None
+        and payload.clear_webhook_secret is None
         and payload.is_active is None
         and payload.is_default is None
     ):
@@ -169,13 +182,18 @@ async def admin_update_model(
     updated = update_chat_model(
         model_id=model_id,
         provider=payload.provider,
-        client_type=payload.client_type,
+        openai_api=payload.openai_api,
         model=payload.model,
         display_name=payload.display_name,
         description=payload.description,
         parameters=payload.parameters,
+        client_options=payload.client_options,
+        chat_create_options=payload.chat_create_options,
+        responses_create_options=payload.responses_create_options,
         api_key=payload.api_key,
         clear_api_key=payload.clear_api_key,
+        webhook_secret=payload.webhook_secret,
+        clear_webhook_secret=payload.clear_webhook_secret,
         is_active=payload.is_active,
         is_default=payload.is_default,
     )

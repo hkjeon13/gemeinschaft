@@ -46,6 +46,10 @@ def _chat_model(selected: ResolvedChatModel) -> AsyncOpenAIChatModel:
             temperature=temperature,
             max_tokens=max_tokens,
             request_options=extra_options,
+            client_options=selected.client_options,
+            openai_api=selected.openai_api,
+            chat_create_options=selected.chat_create_options,
+            responses_create_options=selected.responses_create_options,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
@@ -140,10 +144,10 @@ async def create_dialogue(
         role="user",
     )
     selected_model = resolve_chat_model(payload.model_id)
-    if selected_model.client_type != "openai":
+    if selected_model.provider != "openai":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported client_type: {selected_model.client_type}",
+            detail=f"Unsupported provider: {selected_model.provider}",
         )
     model_client = _chat_model(selected_model)
 
