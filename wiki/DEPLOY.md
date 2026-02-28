@@ -5,6 +5,61 @@ This document describes production-style deployment for this project with:
 - `postgres` (separate Docker service)
 - RS256 JWT keys and auth user data mounted from `./secrets`
 
+## 0) From Zero (copy/paste)
+
+Run this sequence on a fresh host:
+
+```bash
+# 0) project
+git clone <repo-url> gemeinschaft
+cd gemeinschaft
+cp .env.example .env
+mkdir -p secrets
+
+# 1) JWT keys (RS256)
+python app/scripts/generate_rsa_jwt_keys.py \
+  --kid k2026_02 \
+  --private-out secrets/jwt_private_keys.json \
+  --public-out secrets/jwt_public_keys.json
+
+# 2) bcrypt hash (copy output)
+python - <<'PY'
+import bcrypt
+print(bcrypt.hashpw(b'alice-pass', bcrypt.gensalt()).decode())
+PY
+
+# 3) auth user file (paste real hash from step 2)
+cat > secrets/auth_users.json <<'JSON'
+{
+  "alice": {
+    "password_hash": "$2b$12$REPLACE_WITH_REAL_BCRYPT_HASH",
+    "role": "member",
+    "tenant": "default",
+    "scopes": ["conversation:read", "conversation:write"]
+  }
+}
+JSON
+
+# 4) set env values
+sed -i 's/^JWT_ACTIVE_KID=.*/JWT_ACTIVE_KID=k2026_02/' .env
+grep -q '^AUTH_USERS_FILE=' .env || echo 'AUTH_USERS_FILE=/run/secrets/auth_users.json' >> .env
+grep -q '^POSTGRES_PASSWORD=' .env || echo 'POSTGRES_PASSWORD=change-me-now' >> .env
+
+# 5) validate + deploy
+docker compose config
+docker compose up -d --build
+docker compose ps
+```
+
+Then verify:
+
+```bash
+curl -s http://localhost:8000/auth/.well-known/jwks.json
+curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"alice-pass"}'
+```
+
 ## 1) Prerequisites
 
 - Docker Engine + Docker Compose v2
@@ -163,3 +218,39 @@ docker compose up -d --build
 ```
 
 3. Verify `/auth/me` and `/conversation/*` authorization paths.
+
+## 11) Troubleshooting
+
+### 11.1 `version is obsolete` warning
+
+If you see:
+- `the attribute version is obsolete`
+
+It is a Docker Compose v2 warning only. Deployment still works.  
+You can remove top-level `version: "3.9"` from `docker-compose.yml` to silence it.
+
+### 11.2 `AUTH user 'alice' has invalid bcrypt hash`
+
+Cause:
+- `secrets/auth_users.json` contains a non-bcrypt value (example placeholder or broken string).
+
+Fix:
+1. Regenerate bcrypt hash.
+2. Replace `password_hash` with the full generated value.
+3. Restart app:
+
+```bash
+docker compose up -d --build app
+docker compose logs -f app
+```
+
+### 11.3 JWT key parse/validation errors
+
+Cause:
+- `secrets/jwt_private_keys.json` or `secrets/jwt_public_keys.json` still contains template `...` values.
+- `JWT_ACTIVE_KID` does not match a key id in `jwt_private_keys.json`.
+
+Fix:
+1. Regenerate keys with `generate_rsa_jwt_keys.py`.
+2. Set `.env` `JWT_ACTIVE_KID` to an existing kid.
+3. Redeploy.
