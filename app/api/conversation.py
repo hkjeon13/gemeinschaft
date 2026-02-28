@@ -471,15 +471,6 @@ async def clear_conversation_default_model(access: AccessContext = Depends(requi
 @conversation_router.get("/{conversation_id}/models", response_model=ConversationAssignedModelListSchema)
 async def get_conversation_models(conversation_id: str, access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:get", resource_id=conversation_id)
-    conversation = await run_in_threadpool(
-        conversation_store.get_conversation,
-        tenant_id=access.tenant,
-        user_id=access.subject,
-        conversation_id=conversation_id,
-    )
-    if conversation is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-
     model_ids = await run_in_threadpool(
         _conversation_model_ids_or_default,
         tenant_id=access.tenant,
