@@ -487,15 +487,6 @@ async def add_conversation_model(
     access: AccessContext = Depends(require_access_context),
 ):
     authorize_action(access, action="conversation:update", resource_id=conversation_id)
-    conversation = await run_in_threadpool(
-        conversation_store.get_conversation,
-        tenant_id=access.tenant,
-        user_id=access.subject,
-        conversation_id=conversation_id,
-    )
-    if conversation is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-
     requested_model_id = payload.model_id.strip()
     requested_model = await run_in_threadpool(get_chat_model, requested_model_id)
     if requested_model is None:
