@@ -28,6 +28,10 @@ Each service currently exposes `GET /healthz` and `GET /readyz`.
 `make dev` starts each service via `uvicorn` and keeps them running in one terminal.
 `make dev-reload` enables `uvicorn --reload` for local file-watch development.
 
+## Build & deploy
+
+- See [`docs/BUILD_AND_DEPLOY.md`](docs/BUILD_AND_DEPLOY.md)
+
 ## Quality checks
 
 - Lint: `make lint`
