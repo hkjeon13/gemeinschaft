@@ -131,6 +131,19 @@ def _resolve_conversation_title(conversation: Dict[str, Any]) -> str:
     return "New conversation"
 
 
+def _has_unread_assistant_messages(messages: List[Dict[str, Any]], last_read_at: Optional[Any]) -> bool:
+    if not messages:
+        return False
+    cutoff = _to_epoch(last_read_at) if last_read_at else float("-inf")
+    for item in messages:
+        if str(item.get("role", "")).strip().lower() != "assistant":
+            continue
+        created_at = item.get("created_at")
+        if _to_epoch(created_at) > cutoff:
+            return True
+    return False
+
+
 def _truthy(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
@@ -182,7 +195,14 @@ class ConversationStoreBackend:
     def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
-    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        mark_read: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
     def append_message(
@@ -203,6 +223,9 @@ class ConversationStoreBackend:
         raise NotImplementedError
 
     def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        raise NotImplementedError
+
+    def mark_conversation_read(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
         raise NotImplementedError
 
     def start_background_tasks(self) -> None:
@@ -228,25 +251,39 @@ class InMemoryConversationStore(ConversationStoreBackend):
             for conversation_id, conversation in user_conversations.items():
                 if not bool(conversation.get("visible", True)):
                     continue
+                messages = [item for item in conversation.get("messages", []) if isinstance(item, dict)]
                 summaries.append(
                     {
                         "conversation_id": conversation_id,
                         "title": _resolve_conversation_title(conversation),
-                        "message_count": len(conversation["messages"]),
+                        "message_count": len(messages),
                         "updated_at": conversation["updated_at"],
+                        "has_unread": _has_unread_assistant_messages(
+                            [_normalized_message(item) for item in messages],
+                            conversation.get("last_read_at"),
+                        ),
                     }
                 )
 
         summaries.sort(key=lambda item: item["updated_at"], reverse=True)
         return summaries
 
-    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        mark_read: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         with self._lock:
             tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
             user_conversations = tenant_conversations.get(user_id, {})
             conversation = user_conversations.get(conversation_id)
             if conversation is None or not bool(conversation.get("visible", True)):
                 return None
+            if mark_read:
+                conversation["last_read_at"] = _now_iso()
             return {
                 "conversation_id": conversation_id,
                 "tenant_id": tenant_id,
@@ -293,11 +330,14 @@ class InMemoryConversationStore(ConversationStoreBackend):
                     "title": None,
                     "visible": True,
                     "hidden_at": None,
+                    "last_read_at": now,
                 },
             )
             conversation["visible"] = True
             conversation["hidden_at"] = None
             conversation["messages"].append(entry)
+            if _normalize_role(role) == "user":
+                conversation["last_read_at"] = now
             if _normalize_title(conversation.get("title")) is None:
                 conversation["title"] = _title_from_messages(conversation["messages"]) or "New conversation"
             conversation["updated_at"] = now
@@ -337,6 +377,16 @@ class InMemoryConversationStore(ConversationStoreBackend):
             conversation["updated_at"] = _now_iso()
             return normalized_title
 
+    def mark_conversation_read(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        with self._lock:
+            tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
+            user_conversations = tenant_conversations.get(user_id, {})
+            conversation = user_conversations.get(conversation_id)
+            if conversation is None or not bool(conversation.get("visible", True)):
+                return False
+            conversation["last_read_at"] = _now_iso()
+            return True
+
 
 class PostgresConversationStore(ConversationStoreBackend):
     def _dsn(self) -> str:
@@ -371,6 +421,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             title TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_read_at TIMESTAMPTZ,
             visible BOOLEAN NOT NULL DEFAULT TRUE,
             hidden_at TIMESTAMPTZ,
             PRIMARY KEY (tenant_id, user_id, conversation_id)
@@ -378,6 +429,8 @@ class PostgresConversationStore(ConversationStoreBackend):
 
         ALTER TABLE conversations
             ADD COLUMN IF NOT EXISTS title TEXT;
+        ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
         ALTER TABLE conversations
             ADD COLUMN IF NOT EXISTS visible BOOLEAN NOT NULL DEFAULT TRUE;
         ALTER TABLE conversations
@@ -441,6 +494,10 @@ class PostgresConversationStore(ConversationStoreBackend):
         )
         WHERE c.title IS NULL OR TRIM(c.title) = '';
 
+        UPDATE conversations
+        SET last_read_at = COALESCE(last_read_at, updated_at, NOW())
+        WHERE last_read_at IS NULL;
+
         CREATE INDEX IF NOT EXISTS idx_conversation_messages_lookup
             ON conversation_messages(tenant_id, user_id, conversation_id, created_at ASC, message_id ASC);
         """
@@ -455,14 +512,28 @@ class PostgresConversationStore(ConversationStoreBackend):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT c.conversation_id, c.title, COUNT(m.message_id) AS message_count, c.updated_at
+                    SELECT
+                        c.conversation_id,
+                        c.title,
+                        (
+                            SELECT COUNT(*)
+                            FROM conversation_messages m
+                            WHERE m.tenant_id = c.tenant_id
+                              AND m.user_id = c.user_id
+                              AND m.conversation_id = c.conversation_id
+                        ) AS message_count,
+                        c.updated_at,
+                        EXISTS (
+                            SELECT 1
+                            FROM conversation_messages mx
+                            WHERE mx.tenant_id = c.tenant_id
+                              AND mx.user_id = c.user_id
+                              AND mx.conversation_id = c.conversation_id
+                              AND mx.role = 'assistant'
+                              AND mx.created_at > COALESCE(c.last_read_at, c.created_at)
+                        ) AS has_unread
                     FROM conversations c
-                    LEFT JOIN conversation_messages m
-                      ON c.tenant_id = m.tenant_id
-                     AND c.user_id = m.user_id
-                     AND c.conversation_id = m.conversation_id
                     WHERE c.tenant_id = %s AND c.user_id = %s AND c.visible = TRUE
-                    GROUP BY c.conversation_id, c.title, c.updated_at
                     ORDER BY c.updated_at DESC
                     """,
                     (tenant_id, user_id),
@@ -476,12 +547,30 @@ class PostgresConversationStore(ConversationStoreBackend):
                 "title": _normalize_title(row[1]) or "New conversation",
                 "message_count": int(row[2] or 0),
                 "updated_at": _to_iso(row[3]),
+                "has_unread": bool(row[4]),
             }
             for row in rows
         ]
 
-    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        mark_read: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
+            if mark_read:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE conversations
+                        SET last_read_at = NOW()
+                        WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s AND visible = TRUE
+                        """,
+                        (tenant_id, user_id, conversation_id),
+                    )
             payload = self._fetch_conversation(conn, tenant_id, user_id, conversation_id, include_hidden=False)
             conn.commit()
         return payload
@@ -506,25 +595,32 @@ class PostgresConversationStore(ConversationStoreBackend):
         normalized_model_display_name = str(model_display_name).strip() if model_display_name is not None else None
         normalized_provider = str(provider).strip().lower() if provider is not None else None
         title_candidate = _normalize_title(message_text) if normalized_role == "user" else None
+        is_user_message = normalized_role == "user"
 
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversations (tenant_id, user_id, conversation_id, title, updated_at, visible, hidden_at)
-                    VALUES (%s, %s, %s, %s, NOW(), TRUE, NULL)
+                    INSERT INTO conversations (
+                        tenant_id, user_id, conversation_id, title, updated_at, last_read_at, visible, hidden_at
+                    )
+                    VALUES (%s, %s, %s, %s, NOW(), CASE WHEN %s THEN NOW() ELSE NULL END, TRUE, NULL)
                     ON CONFLICT (tenant_id, user_id, conversation_id)
                     DO UPDATE SET
                         updated_at = EXCLUDED.updated_at,
                         visible = TRUE,
                         hidden_at = NULL,
+                        last_read_at = CASE
+                            WHEN %s THEN NOW()
+                            ELSE conversations.last_read_at
+                        END,
                         title = CASE
                             WHEN conversations.title IS NULL OR TRIM(conversations.title) = ''
                                 THEN COALESCE(EXCLUDED.title, conversations.title)
                             ELSE conversations.title
                         END
                     """,
-                    (tenant_id, user_id, conversation_id, title_candidate),
+                    (tenant_id, user_id, conversation_id, title_candidate, is_user_message, is_user_message),
                 )
                 cur.execute(
                     """
@@ -569,6 +665,11 @@ class PostgresConversationStore(ConversationStoreBackend):
             )
 
         updated_at = _parse_iso_datetime(conversation.get("updated_at"))
+        raw_last_read_at = conversation.get("last_read_at")
+        if raw_last_read_at is None:
+            last_read_at = updated_at
+        else:
+            last_read_at = _parse_iso_datetime(raw_last_read_at)
         raw_messages = conversation.get("messages", [])
         messages = [item for item in raw_messages if isinstance(item, dict)]
         normalized_title = _normalize_title(conversation.get("title"))
@@ -579,16 +680,19 @@ class PostgresConversationStore(ConversationStoreBackend):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversations (tenant_id, user_id, conversation_id, title, updated_at, visible, hidden_at)
-                    VALUES (%s, %s, %s, %s, %s, TRUE, NULL)
+                    INSERT INTO conversations (
+                        tenant_id, user_id, conversation_id, title, updated_at, last_read_at, visible, hidden_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, TRUE, NULL)
                     ON CONFLICT (tenant_id, user_id, conversation_id)
                     DO UPDATE SET
                         title = EXCLUDED.title,
                         updated_at = EXCLUDED.updated_at,
+                        last_read_at = EXCLUDED.last_read_at,
                         visible = TRUE,
                         hidden_at = NULL
                     """,
-                    (tenant_id, user_id, conversation_id, normalized_title, updated_at),
+                    (tenant_id, user_id, conversation_id, normalized_title, updated_at, last_read_at),
                 )
 
                 cur.execute(
@@ -686,6 +790,21 @@ class PostgresConversationStore(ConversationStoreBackend):
             return None
         return _normalize_title(row[0]) or normalized_title
 
+    def mark_conversation_read(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET last_read_at = NOW()
+                    WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s AND visible = TRUE
+                    """,
+                    (tenant_id, user_id, conversation_id),
+                )
+                updated = bool(cur.rowcount and cur.rowcount > 0)
+            conn.commit()
+        return updated
+
     def _fetch_conversation(
         self,
         conn: Any,
@@ -698,7 +817,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             if include_hidden:
                 cur.execute(
                     """
-                    SELECT conversation_id, title, updated_at
+                    SELECT conversation_id, title, updated_at, last_read_at
                     FROM conversations
                     WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
                     """,
@@ -707,7 +826,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             else:
                 cur.execute(
                     """
-                    SELECT conversation_id, title, updated_at
+                    SELECT conversation_id, title, updated_at, last_read_at
                     FROM conversations
                     WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s AND visible = TRUE
                     """,
@@ -751,6 +870,8 @@ class PostgresConversationStore(ConversationStoreBackend):
             "title": _normalize_title(header[1]) or (_title_from_messages(messages) or "New conversation"),
             "messages": messages,
             "updated_at": _to_iso(header[2]),
+            "last_read_at": _to_iso(header[3]) if header[3] is not None else None,
+            "has_unread": _has_unread_assistant_messages(messages, _to_iso(header[3]) if header[3] is not None else None),
         }
 
 
@@ -818,6 +939,7 @@ class RedisHotConversationStore:
             "title": _resolve_conversation_title(conversation),
             "messages": normalized_messages,
             "updated_at": str(conversation.get("updated_at") or _now_iso()),
+            "last_read_at": conversation.get("last_read_at"),
             "_dirty": bool(dirty),
             "_last_activity_epoch": float(last_activity_epoch),
         }
@@ -849,6 +971,7 @@ class RedisHotConversationStore:
             "title": _normalize_title(payload.get("title")),
             "messages": [_normalized_message(item) for item in messages if isinstance(item, dict)],
             "updated_at": str(payload.get("updated_at") or _now_iso()),
+            "last_read_at": payload.get("last_read_at"),
             "_dirty": bool(payload.get("_dirty", False)),
             "_last_activity_epoch": last_activity_epoch,
         }
@@ -864,6 +987,7 @@ class RedisHotConversationStore:
             "title": _resolve_conversation_title(cached),
             "messages": [_normalized_message(item) for item in cached.get("messages", [])],
             "updated_at": cached["updated_at"],
+            "last_read_at": cached.get("last_read_at"),
         }
 
     def cache_conversation(
@@ -890,6 +1014,7 @@ class RedisHotConversationStore:
             "title": _resolve_conversation_title(conversation),
             "messages": [_normalized_message(item) for item in conversation.get("messages", []) if isinstance(item, dict)],
             "updated_at": updated_at,
+            "last_read_at": conversation.get("last_read_at"),
         }
 
         serialized = self._serialize(record, dirty=dirty, last_activity_epoch=activity_epoch)
@@ -904,7 +1029,14 @@ class RedisHotConversationStore:
             pipe.zadd(active_index, {conversation_key: activity_epoch})
             pipe.execute()
 
-    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        mark_read: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         conversation_key = self._conversation_key(tenant_id, user_id, conversation_id)
         client = self._client_or_raise()
         raw = client.get(conversation_key)
@@ -915,6 +1047,10 @@ class RedisHotConversationStore:
         if cached is None:
             self.delete_cached_conversation(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
             return None
+
+        if mark_read:
+            cached["last_read_at"] = _now_iso()
+            self.cache_conversation(cached, dirty=True, last_activity_epoch=time.time())
 
         return self._public_payload(cached)
 
@@ -949,6 +1085,10 @@ class RedisHotConversationStore:
                     "title": _resolve_conversation_title(cached),
                     "message_count": len(cached.get("messages", [])),
                     "updated_at": cached["updated_at"],
+                    "has_unread": _has_unread_assistant_messages(
+                        [_normalized_message(item) for item in cached.get("messages", []) if isinstance(item, dict)],
+                        cached.get("last_read_at"),
+                    ),
                 }
             )
 
@@ -1011,6 +1151,7 @@ class RedisHotConversationStore:
             ),
             "messages": existing_messages,
             "updated_at": now_iso,
+            "last_read_at": now_iso if normalized_role == "user" else existing.get("last_read_at"),
         }
 
         self.cache_conversation(updated, dirty=True, last_activity_epoch=now_epoch)
@@ -1027,6 +1168,14 @@ class RedisHotConversationStore:
         existing["updated_at"] = _now_iso()
         self.cache_conversation(existing, dirty=True, last_activity_epoch=time.time())
         return normalized_title
+
+    def mark_conversation_read(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        existing = self.get_conversation(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
+        if existing is None:
+            return False
+        existing["last_read_at"] = _now_iso()
+        self.cache_conversation(existing, dirty=True, last_activity_epoch=time.time())
+        return True
 
     def delete_cached_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> None:
         client = self._client_or_raise()
@@ -1193,6 +1342,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 "title": _normalize_title(item.get("title")) or "New conversation",
                 "message_count": int(item.get("message_count", 0) or 0),
                 "updated_at": str(item.get("updated_at") or _now_iso()),
+                "has_unread": bool(item.get("has_unread", False)),
             }
 
         for item in hot_list:
@@ -1204,14 +1354,17 @@ class HybridConversationStore(ConversationStoreBackend):
                 "title": _normalize_title(item.get("title")) or "New conversation",
                 "message_count": int(item.get("message_count", 0) or 0),
                 "updated_at": str(item.get("updated_at") or _now_iso()),
+                "has_unread": bool(item.get("has_unread", False)),
             }
             existing = merged.get(conversation_id)
             if existing is None:
                 merged[conversation_id] = next_summary
                 continue
 
-            if _to_epoch(next_summary["updated_at"]) >= _to_epoch(existing["updated_at"]):
+            if _to_epoch(next_summary["updated_at"]) > _to_epoch(existing["updated_at"]):
                 merged[conversation_id] = next_summary
+            elif _to_epoch(next_summary["updated_at"]) == _to_epoch(existing["updated_at"]):
+                existing["has_unread"] = bool(existing.get("has_unread", False) or next_summary.get("has_unread", False))
 
         summaries = list(merged.values())
         summaries.sort(key=lambda item: _to_epoch(item["updated_at"]), reverse=True)
@@ -1230,7 +1383,14 @@ class HybridConversationStore(ConversationStoreBackend):
 
         return self._merge_summaries(cold_list=cold_list, hot_list=hot_list)
 
-    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        mark_read: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         self._flush_idle_best_effort()
 
         try:
@@ -1238,8 +1398,15 @@ class HybridConversationStore(ConversationStoreBackend):
                 tenant_id=tenant_id,
                 user_id=user_id,
                 conversation_id=conversation_id,
+                mark_read=mark_read,
             )
             if hot is not None:
+                if mark_read:
+                    try:
+                        self._cold_store.replace_conversation(hot)
+                        self._hot_store.cache_conversation(hot, dirty=False, last_activity_epoch=time.time())
+                    except Exception:
+                        logger.exception("Failed to persist hot read marker to cold store.")
                 return hot
         except Exception:
             logger.exception("Failed to read hot conversation; checking cold store.")
@@ -1248,6 +1415,7 @@ class HybridConversationStore(ConversationStoreBackend):
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id=conversation_id,
+            mark_read=mark_read,
         )
         if cold is None:
             return None
@@ -1405,6 +1573,15 @@ class HybridConversationStore(ConversationStoreBackend):
             logger.exception("Failed to warm updated conversation title into hot cache.")
         return updated
 
+    def mark_conversation_read(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        marked = self.get_conversation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            mark_read=True,
+        )
+        return marked is not None
+
 
 _memory_store = InMemoryConversationStore()
 _postgres_store = PostgresConversationStore()
@@ -1453,12 +1630,20 @@ class ConversationStore:
         initialize_conversation_store()
         return _get_store().list_conversations(tenant_id=tenant_id, user_id=user_id)
 
-    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        mark_read: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         initialize_conversation_store()
         return _get_store().get_conversation(
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id=conversation_id,
+            mark_read=mark_read,
         )
 
     def append_message(
@@ -1501,6 +1686,14 @@ class ConversationStore:
             user_id=user_id,
             conversation_id=conversation_id,
             title=title,
+        )
+
+    def mark_conversation_read(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        initialize_conversation_store()
+        return _get_store().mark_conversation_read(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
         )
 
 

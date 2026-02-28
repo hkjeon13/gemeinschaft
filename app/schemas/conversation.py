@@ -44,6 +44,7 @@ class ConversationSummarySchema(BaseModel):
     title: str
     message_count: int
     updated_at: str
+    has_unread: bool = False
 
 
 class ConversationVisibilitySchema(BaseModel):
@@ -87,4 +88,22 @@ class UserDefaultModelSchema(BaseModel):
 
 
 class UserDefaultModelUpdateSchema(BaseModel):
+    model_id: str = Field(..., min_length=1)
+
+
+class ConversationAssignedModelSchema(BaseModel):
+    model_id: str
+    provider: str
+    openai_api: str
+    model: str
+    display_name: str
+    description: str
+
+
+class ConversationAssignedModelListSchema(BaseModel):
+    conversation_id: str
+    models: List[ConversationAssignedModelSchema]
+
+
+class ConversationAssignedModelUpdateSchema(BaseModel):
     model_id: str = Field(..., min_length=1)

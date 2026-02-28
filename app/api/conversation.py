@@ -1,4 +1,7 @@
+import asyncio
 import json
+import logging
+import random
 from typing import Any, AsyncIterator, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -7,6 +10,9 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas.conversation import (
     ConversationDetailSchema,
+    ConversationAssignedModelListSchema,
+    ConversationAssignedModelSchema,
+    ConversationAssignedModelUpdateSchema,
     ConversationModelOptionSchema,
     ConversationSummarySchema,
     ConversationTitleSchema,
@@ -26,9 +32,12 @@ from app.services.chat_model_registry import (
     resolve_chat_model,
 )
 from app.services.conversation_store import conversation_store
+from app.services.conversation_model_list_store import conversation_model_list_store
 from app.services.user_model_preference_store import user_model_preference_store
 
 conversation_router = APIRouter()
+logger = logging.getLogger(__name__)
+_STREAM_EVENT_QUEUE_MAXSIZE = 256
 
 
 def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
@@ -59,6 +68,60 @@ def _effective_default_model(tenant_id: str, user_id: str) -> tuple[str, str, st
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="No active conversation model is configured.",
     )
+
+
+def _conversation_model_ids_or_default(tenant_id: str, user_id: str, conversation_id: str) -> list[str]:
+    raw_ids = conversation_model_list_store.get_model_ids(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    valid_ids: list[str] = []
+    seen: set[str] = set()
+    for candidate in raw_ids:
+        model = get_chat_model(candidate)
+        if model is None or not _is_supported_conversation_model(model.provider, model.is_active):
+            continue
+        if model.model_id in seen:
+            continue
+        seen.add(model.model_id)
+        valid_ids.append(model.model_id)
+
+    if not valid_ids:
+        default_model_id, _, _ = _effective_default_model(tenant_id=tenant_id, user_id=user_id)
+        valid_ids = [default_model_id]
+
+    if valid_ids != raw_ids:
+        conversation_model_list_store.set_model_ids(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            model_ids=valid_ids,
+        )
+
+    return valid_ids
+
+
+def _conversation_model_list_response(
+    conversation_id: str,
+    model_ids: list[str],
+) -> ConversationAssignedModelListSchema:
+    models: list[ConversationAssignedModelSchema] = []
+    for model_id in model_ids:
+        model = get_chat_model(model_id)
+        if model is None or not _is_supported_conversation_model(model.provider, model.is_active):
+            continue
+        models.append(
+            ConversationAssignedModelSchema(
+                model_id=model.model_id,
+                provider=model.provider,
+                openai_api=model.openai_api,
+                model=model.model,
+                display_name=model.display_name,
+                description=model.description,
+            )
+        )
+    return ConversationAssignedModelListSchema(conversation_id=conversation_id, models=models)
 
 
 def _chat_model(selected: ResolvedChatModel) -> AsyncOpenAIChatModel:
@@ -159,7 +222,63 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def _stream_assistant_reply(
+def _log_background_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.exception("Detached assistant generation task failed.")
+
+
+def _put_stream_event(queue: asyncio.Queue[tuple[str, dict[str, Any]]], event: str, data: dict[str, Any]) -> None:
+    try:
+        queue.put_nowait((event, data))
+        return
+    except asyncio.QueueFull:
+        if event not in {"done", "error"}:
+            return
+
+    try:
+        queue.get_nowait()
+    except asyncio.QueueEmpty:
+        return
+
+    try:
+        queue.put_nowait((event, data))
+    except asyncio.QueueFull:
+        return
+
+
+async def _append_assistant_message(
+    *,
+    tenant_id: str,
+    user_id: str,
+    conversation_id: str,
+    message: str,
+    model_id: str,
+    model_name: str,
+    model_display_name: str,
+    provider: str,
+) -> dict[str, Any] | None:
+    text = message.strip()
+    if not text:
+        return None
+    return await run_in_threadpool(
+        conversation_store.append_message,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        message=text,
+        role="assistant",
+        model_id=model_id,
+        model_name=model_name,
+        model_display_name=model_display_name,
+        provider=provider,
+    )
+
+
+async def _generate_assistant_reply(
     *,
     tenant_id: str,
     user_id: str,
@@ -170,31 +289,57 @@ async def _stream_assistant_reply(
     provider: str,
     chat_model: AsyncOpenAIChatModel,
     messages: list[dict[str, str]],
-) -> AsyncIterator[str]:
+) -> dict[str, Any] | None:
+    assistant_reply = await chat_model.generate_messages(messages)
+    return await _append_assistant_message(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        message=assistant_reply,
+        model_id=model_id,
+        model_name=model_name,
+        model_display_name=model_display_name,
+        provider=provider,
+    )
+
+
+async def _stream_assistant_reply_task(
+    *,
+    tenant_id: str,
+    user_id: str,
+    conversation_id: str,
+    model_id: str,
+    model_name: str,
+    model_display_name: str,
+    provider: str,
+    chat_model: AsyncOpenAIChatModel,
+    messages: list[dict[str, str]],
+    event_queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+) -> None:
     chunks: list[str] = []
     try:
         async for delta in chat_model.stream_messages(messages):
             chunks.append(delta)
-            yield _sse("delta", {"text": delta})
+            _put_stream_event(event_queue, "delta", {"text": delta})
     except Exception as exc:
-        yield _sse("error", {"detail": str(exc)})
+        _put_stream_event(event_queue, "error", {"detail": str(exc)})
         return
 
     full_text = "".join(chunks).strip()
     if full_text:
-        await run_in_threadpool(
-            conversation_store.append_message,
+        await _append_assistant_message(
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id=conversation_id,
             message=full_text,
-            role="assistant",
             model_id=model_id,
             model_name=model_name,
             model_display_name=model_display_name,
             provider=provider,
         )
-    yield _sse(
+
+    _put_stream_event(
+        event_queue,
         "done",
         {
             "conversation_id": conversation_id,
@@ -204,6 +349,30 @@ async def _stream_assistant_reply(
             "provider": provider,
         },
     )
+
+
+async def _stream_assistant_reply(
+    *,
+    tenant_id: str,
+    user_id: str,
+    event_queue: asyncio.Queue[tuple[str, dict[str, Any]]],
+) -> AsyncIterator[str]:
+    try:
+        while True:
+            event, data = await event_queue.get()
+            if event == "done":
+                await run_in_threadpool(
+                    conversation_store.mark_conversation_read,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    conversation_id=str(data.get("conversation_id") or ""),
+                )
+            yield _sse(event, data)
+            if event in {"done", "error"}:
+                return
+    except asyncio.CancelledError:
+        # Client disconnected; detached generation task continues and persists response.
+        return
 
 
 @conversation_router.get("/list", response_model=List[ConversationSummarySchema])
@@ -299,6 +468,110 @@ async def clear_conversation_default_model(access: AccessContext = Depends(requi
     return UserDefaultModelSchema(model_id=model_id, display_name=display_name, source=source)
 
 
+@conversation_router.get("/{conversation_id}/models", response_model=ConversationAssignedModelListSchema)
+async def get_conversation_models(conversation_id: str, access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="conversation:get", resource_id=conversation_id)
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+    model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    return await run_in_threadpool(_conversation_model_list_response, conversation_id, model_ids)
+
+
+@conversation_router.post("/{conversation_id}/models", response_model=ConversationAssignedModelListSchema)
+async def add_conversation_model(
+    conversation_id: str,
+    payload: ConversationAssignedModelUpdateSchema,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:update", resource_id=conversation_id)
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+    requested_model_id = payload.model_id.strip()
+    requested_model = await run_in_threadpool(get_chat_model, requested_model_id)
+    if requested_model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Requested model is not registered.")
+    if not _is_supported_conversation_model(requested_model.provider, requested_model.is_active):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requested model is not available for conversations.")
+
+    model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    if requested_model.model_id not in model_ids:
+        model_ids.append(requested_model.model_id)
+    updated_ids = await run_in_threadpool(
+        conversation_model_list_store.set_model_ids,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+        model_ids=model_ids,
+    )
+    return await run_in_threadpool(_conversation_model_list_response, conversation_id, updated_ids)
+
+
+@conversation_router.delete("/{conversation_id}/models/{model_id}", response_model=ConversationAssignedModelListSchema)
+async def remove_conversation_model(
+    conversation_id: str,
+    model_id: str,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:update", resource_id=conversation_id)
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+
+    model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    normalized_model_id = model_id.strip()
+    if normalized_model_id not in model_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model is not configured for this conversation.")
+    if len(model_ids) <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one model must remain configured for the conversation.",
+        )
+
+    updated_ids = [item for item in model_ids if item != normalized_model_id]
+    stored_ids = await run_in_threadpool(
+        conversation_model_list_store.set_model_ids,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+        model_ids=updated_ids,
+    )
+    return await run_in_threadpool(_conversation_model_list_response, conversation_id, stored_ids)
+
+
 @conversation_router.get("/{conversation_id}", response_model=ConversationDetailSchema)
 async def get_dialogue(conversation_id: str, access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:get", resource_id=conversation_id)
@@ -307,6 +580,7 @@ async def get_dialogue(conversation_id: str, access: AccessContext = Depends(req
         tenant_id=access.tenant,
         user_id=access.subject,
         conversation_id=conversation_id,
+        mark_read=True,
     )
     if conversation is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
@@ -330,13 +604,25 @@ async def create_dialogue(
         message=user_message,
         role="user",
     )
-    selected_model_id: str | None = payload.model_id
-    if selected_model_id is None:
-        selected_model_id, _, _ = await run_in_threadpool(
-            _effective_default_model,
-            tenant_id=access.tenant,
-            user_id=access.subject,
-        )
+    conversation_model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+
+    selected_model_id: str
+    if payload.model_id is not None:
+        requested_model_id = payload.model_id.strip()
+        if requested_model_id not in conversation_model_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Requested model is not configured for this conversation.",
+            )
+        selected_model_id = requested_model_id
+    else:
+        selected_model_id = random.choice(conversation_model_ids)
+
     selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
     if selected_model.provider != "openai":
         raise HTTPException(
@@ -350,8 +636,9 @@ async def create_dialogue(
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to build chat messages.")
 
     if stream:
-        return StreamingResponse(
-            _stream_assistant_reply(
+        event_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=_STREAM_EVENT_QUEUE_MAXSIZE)
+        stream_task = asyncio.create_task(
+            _stream_assistant_reply_task(
                 tenant_id=access.tenant,
                 user_id=access.subject,
                 conversation_id=conversation_id,
@@ -361,31 +648,53 @@ async def create_dialogue(
                 provider=selected_model.provider,
                 chat_model=model_client,
                 messages=messages,
+                event_queue=event_queue,
+            )
+        )
+        stream_task.add_done_callback(_log_background_task_result)
+        return StreamingResponse(
+            _stream_assistant_reply(
+                tenant_id=access.tenant,
+                user_id=access.subject,
+                event_queue=event_queue,
             ),
             media_type="text/event-stream",
         )
 
+    generation_task = asyncio.create_task(
+        _generate_assistant_reply(
+            tenant_id=access.tenant,
+            user_id=access.subject,
+            conversation_id=conversation_id,
+            model_id=selected_model.model_id,
+            model_name=selected_model.model,
+            model_display_name=selected_model.display_name,
+            provider=selected_model.provider,
+            chat_model=model_client,
+            messages=messages,
+        )
+    )
+    generation_task.add_done_callback(_log_background_task_result)
+
     try:
-        assistant_reply = await model_client.generate_messages(messages)
+        generated_conversation = await asyncio.shield(generation_task)
+    except asyncio.CancelledError:
+        # Request ended early; detached generation continues and persists reply.
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate assistant response: {exc}",
         )
 
-    if assistant_reply.strip():
-        conversation = await run_in_threadpool(
-            conversation_store.append_message,
+    if generated_conversation is not None:
+        await run_in_threadpool(
+            conversation_store.mark_conversation_read,
             tenant_id=access.tenant,
             user_id=access.subject,
             conversation_id=conversation_id,
-            message=assistant_reply,
-            role="assistant",
-            model_id=selected_model.model_id,
-            model_name=selected_model.model,
-            model_display_name=selected_model.display_name,
-            provider=selected_model.provider,
         )
+        return generated_conversation
     return conversation
 
 

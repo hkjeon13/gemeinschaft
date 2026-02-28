@@ -14,6 +14,7 @@ from .services.conversation_store import (
     shutdown_conversation_store,
     start_conversation_store_background_tasks,
 )
+from .services.conversation_model_list_store import initialize_conversation_model_list_store
 from .services.database import validate_database_settings
 from .services.security_state import initialize_security_state
 from .services.user_model_preference_store import initialize_user_model_preference_store
@@ -65,6 +66,7 @@ async def startup_validate_auth_settings() -> None:
     validate_database_settings()
     initialize_chat_model_registry()
     initialize_user_model_preference_store()
+    initialize_conversation_model_list_store()
     start_conversation_store_background_tasks()
     initialize_security_state()
 
