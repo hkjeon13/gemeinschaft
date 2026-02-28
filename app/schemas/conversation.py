@@ -45,6 +45,11 @@ class ConversationSummarySchema(BaseModel):
     updated_at: str
 
 
+class ConversationVisibilitySchema(BaseModel):
+    conversation_id: str
+    visible: bool
+
+
 class ConversationDetailSchema(BaseModel):
     conversation_id: str
     tenant_id: str

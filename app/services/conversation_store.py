@@ -161,6 +161,9 @@ class ConversationStoreBackend:
     ) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def hide_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        raise NotImplementedError
+
     def start_background_tasks(self) -> None:
         return
 
@@ -182,6 +185,8 @@ class InMemoryConversationStore(ConversationStoreBackend):
             user_conversations = tenant_conversations.get(user_id, {})
             summaries = []
             for conversation_id, conversation in user_conversations.items():
+                if not bool(conversation.get("visible", True)):
+                    continue
                 summaries.append(
                     {
                         "conversation_id": conversation_id,
@@ -198,7 +203,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
             tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
             user_conversations = tenant_conversations.get(user_id, {})
             conversation = user_conversations.get(conversation_id)
-            if conversation is None:
+            if conversation is None or not bool(conversation.get("visible", True)):
                 return None
             return {
                 "conversation_id": conversation_id,
@@ -242,8 +247,12 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 {
                     "messages": [],
                     "updated_at": now,
+                    "visible": True,
+                    "hidden_at": None,
                 },
             )
+            conversation["visible"] = True
+            conversation["hidden_at"] = None
             conversation["messages"].append(entry)
             conversation["updated_at"] = now
 
@@ -254,6 +263,18 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 "messages": [_normalized_message(item) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
+
+    def hide_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        with self._lock:
+            tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
+            user_conversations = tenant_conversations.get(user_id, {})
+            conversation = user_conversations.get(conversation_id)
+            if conversation is None:
+                return False
+            conversation["visible"] = False
+            conversation["hidden_at"] = _now_iso()
+            conversation["updated_at"] = _now_iso()
+            return True
 
 
 class PostgresConversationStore(ConversationStoreBackend):
@@ -288,8 +309,15 @@ class PostgresConversationStore(ConversationStoreBackend):
             conversation_id TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            visible BOOLEAN NOT NULL DEFAULT TRUE,
+            hidden_at TIMESTAMPTZ,
             PRIMARY KEY (tenant_id, user_id, conversation_id)
         );
+
+        ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS visible BOOLEAN NOT NULL DEFAULT TRUE;
+        ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS hidden_at TIMESTAMPTZ;
 
         CREATE INDEX IF NOT EXISTS idx_conversations_tenant_user_updated
             ON conversations(tenant_id, user_id, updated_at DESC);
@@ -340,7 +368,7 @@ class PostgresConversationStore(ConversationStoreBackend):
                       ON c.tenant_id = m.tenant_id
                      AND c.user_id = m.user_id
                      AND c.conversation_id = m.conversation_id
-                    WHERE c.tenant_id = %s AND c.user_id = %s
+                    WHERE c.tenant_id = %s AND c.user_id = %s AND c.visible = TRUE
                     GROUP BY c.conversation_id, c.updated_at
                     ORDER BY c.updated_at DESC
                     """,
@@ -360,7 +388,7 @@ class PostgresConversationStore(ConversationStoreBackend):
 
     def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
         with self._connect() as conn:
-            payload = self._fetch_conversation(conn, tenant_id, user_id, conversation_id)
+            payload = self._fetch_conversation(conn, tenant_id, user_id, conversation_id, include_hidden=False)
             conn.commit()
         return payload
 
@@ -388,10 +416,13 @@ class PostgresConversationStore(ConversationStoreBackend):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at)
-                    VALUES (%s, %s, %s, NOW())
+                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at, visible, hidden_at)
+                    VALUES (%s, %s, %s, NOW(), TRUE, NULL)
                     ON CONFLICT (tenant_id, user_id, conversation_id)
-                    DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    DO UPDATE SET
+                        updated_at = EXCLUDED.updated_at,
+                        visible = TRUE,
+                        hidden_at = NULL
                     """,
                     (tenant_id, user_id, conversation_id),
                 )
@@ -445,10 +476,13 @@ class PostgresConversationStore(ConversationStoreBackend):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at, visible, hidden_at)
+                    VALUES (%s, %s, %s, %s, TRUE, NULL)
                     ON CONFLICT (tenant_id, user_id, conversation_id)
-                    DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    DO UPDATE SET
+                        updated_at = EXCLUDED.updated_at,
+                        visible = TRUE,
+                        hidden_at = NULL
                     """,
                     (tenant_id, user_id, conversation_id, updated_at),
                 )
@@ -512,22 +546,48 @@ class PostgresConversationStore(ConversationStoreBackend):
 
             conn.commit()
 
+    def hide_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET visible = FALSE, hidden_at = NOW(), updated_at = NOW()
+                    WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
+                    """,
+                    (tenant_id, user_id, conversation_id),
+                )
+                hidden = bool(cur.rowcount and cur.rowcount > 0)
+            conn.commit()
+        return hidden
+
     def _fetch_conversation(
         self,
         conn: Any,
         tenant_id: str,
         user_id: str,
         conversation_id: str,
+        include_hidden: bool = False,
     ) -> Optional[Dict[str, Any]]:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT conversation_id, updated_at
-                FROM conversations
-                WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
-                """,
-                (tenant_id, user_id, conversation_id),
-            )
+            if include_hidden:
+                cur.execute(
+                    """
+                    SELECT conversation_id, updated_at
+                    FROM conversations
+                    WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
+                    """,
+                    (tenant_id, user_id, conversation_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT conversation_id, updated_at
+                    FROM conversations
+                    WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s AND visible = TRUE
+                    """,
+                    (tenant_id, user_id, conversation_id),
+                )
             header = cur.fetchone()
             if header is None:
                 return None
@@ -1120,6 +1180,38 @@ class HybridConversationStore(ConversationStoreBackend):
                 provider=provider,
             )
 
+    def hide_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        self._flush_idle_best_effort()
+
+        if not self._write_through():
+            try:
+                hot = self._hot_store.get_conversation(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                if hot is not None:
+                    self._cold_store.replace_conversation(hot)
+            except Exception:
+                logger.exception("Failed to persist hot conversation before hide.")
+
+        hidden = self._cold_store.hide_conversation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
+        try:
+            self._hot_store.delete_cached_conversation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+        except Exception:
+            logger.exception("Failed to remove hidden conversation from hot cache.")
+
+        return hidden
+
 
 _memory_store = InMemoryConversationStore()
 _postgres_store = PostgresConversationStore()
@@ -1199,6 +1291,14 @@ class ConversationStore:
             model_name=model_name,
             model_display_name=model_display_name,
             provider=provider,
+        )
+
+    def hide_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
+        initialize_conversation_store()
+        return _get_store().hide_conversation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
         )
 
 

@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse
 from app.schemas.conversation import (
     ConversationDetailSchema,
     ConversationSummarySchema,
+    ConversationVisibilitySchema,
     MessageCreateSchema,
     MessageInputSchema,
 )
@@ -255,3 +256,17 @@ async def create_dialogue(
             provider=selected_model.provider,
         )
     return conversation
+
+
+@conversation_router.delete("/{conversation_id}", response_model=ConversationVisibilitySchema)
+async def hide_dialogue(conversation_id: str, access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="conversation:delete", resource_id=conversation_id)
+    hidden = await run_in_threadpool(
+        conversation_store.hide_conversation,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    if not hidden:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return {"conversation_id": conversation_id, "visible": False}

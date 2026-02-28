@@ -32,6 +32,10 @@ def _default_policies() -> Dict[str, Dict[str, Any]]:
             "required_scopes": ["conversation:write"],
             "enforce_tenant": True,
         },
+        "conversation:delete": {
+            "required_scopes": ["conversation:write"],
+            "enforce_tenant": True,
+        },
         "admin:user:list": {
             "required_scopes": [],
             "required_roles": ["admin"],

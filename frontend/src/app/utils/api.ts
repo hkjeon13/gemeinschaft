@@ -236,3 +236,11 @@ export async function logout() {
     method: 'POST',
   });
 }
+
+// 대화 숨김(소프트 삭제)
+export async function hideConversation(conversationId: string) {
+  const encodedId = encodeURIComponent(conversationId);
+  return apiRequest<{ conversation_id: string; visible: boolean }>(`/conversation/${encodedId}`, {
+    method: 'DELETE',
+  });
+}
