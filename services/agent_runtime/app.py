@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from services.agent_runtime.runtime import (
@@ -15,6 +15,7 @@ from services.agent_runtime.runtime import (
     UnknownAgentError,
 )
 from services.shared.app_factory import build_service_app
+from services.shared.auth import enforce_role, get_auth_context
 
 app = build_service_app("agent_runtime")
 
@@ -55,7 +56,9 @@ def _flatten_context(context_packet: dict[str, Any]) -> str:
 
 
 @app.post("/internal/agents/run", response_model=RunAgentResponse)
-def run_agent(request: RunAgentRequest) -> RunAgentResponse:
+def run_agent(request: RunAgentRequest, http_request: Request) -> RunAgentResponse:
+    auth = get_auth_context(http_request)
+    enforce_role(auth, allowed_roles={"admin", "operator", "system"})
     runtime = _build_runtime()
     try:
         result: RunAgentResult = runtime.run_agent(

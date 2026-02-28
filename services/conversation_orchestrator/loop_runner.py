@@ -63,6 +63,8 @@ class RunLoopInput:
     max_consecutive_rejections: int = 3
     arbitration_enabled: bool = False
     pause_on_disagreement: bool = True
+    derailment_guard_enabled: bool = False
+    min_topic_keyword_matches: int = 1
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,8 @@ class ConversationLoopRunner:
             raise ValueError("agent_max_output_tokens must be >= 1")
         if payload.max_consecutive_rejections < 1:
             raise ValueError("max_consecutive_rejections must be >= 1")
+        if payload.min_topic_keyword_matches < 1:
+            raise ValueError("min_topic_keyword_matches must be >= 1")
 
         started_at = datetime.now(timezone.utc)
         turns_attempted = 0
@@ -137,7 +141,9 @@ class ConversationLoopRunner:
                     """
                     SELECT id, kind, display_name
                     FROM participant
-                    WHERE conversation_id = %s
+                    WHERE
+                        conversation_id = %s
+                        AND COALESCE(metadata #>> '{moderation,muted}', 'false') <> 'true'
                     ORDER BY joined_at ASC, id ASC
                     """,
                     (str(payload.conversation_id),),
@@ -170,6 +176,26 @@ class ConversationLoopRunner:
                     (str(payload.conversation_id),),
                 )
                 event_seq_last = int(cursor.fetchone()[0])
+
+                cursor.execute(
+                    """
+                    SELECT payload ->> 'instruction'
+                    FROM event
+                    WHERE
+                        conversation_id = %s
+                        AND event_type = 'human.intervention'
+                        AND payload ->> 'intervention_type' = 'steer'
+                    ORDER BY seq_no DESC
+                    LIMIT 1
+                    """,
+                    (str(payload.conversation_id),),
+                )
+                steer_row = cursor.fetchone()
+                steering_instruction = (
+                    str(steer_row[0]).strip()
+                    if steer_row and steer_row[0] is not None and str(steer_row[0]).strip()
+                    else None
+                )
 
                 cursor.execute(
                     """
@@ -208,6 +234,7 @@ class ConversationLoopRunner:
                         objective=objective,
                         context_packet=context_packet,
                         required_citation_ids=required_citation_ids,
+                        steering_instruction=steering_instruction,
                     )
                     validation = self._validator.validate(
                         TurnValidationInput(
@@ -216,6 +243,16 @@ class ConversationLoopRunner:
                             require_citations=payload.require_citations,
                             allowed_citation_ids=allowed_citation_ids,
                             recent_turn_texts=recent_turn_texts,
+                            require_topic_alignment=(
+                                payload.derailment_guard_enabled and participant.kind == "ai"
+                            ),
+                            topic_keywords=self._build_alignment_keywords(
+                                objective=objective,
+                                topic_label=context_packet.get("topic_label"),
+                                topic_summary=context_packet.get("topic_summary"),
+                                steering_instruction=steering_instruction,
+                            ),
+                            min_topic_keyword_matches=payload.min_topic_keyword_matches,
                         )
                     )
                     if validation.is_valid:
@@ -522,6 +559,7 @@ class ConversationLoopRunner:
         objective: str,
         context_packet: dict[str, Any],
         required_citation_ids: list[UUID],
+        steering_instruction: str | None,
     ) -> tuple[str, dict[str, Any]]:
         if participant.kind == "ai" and payload.use_agent_runtime:
             if self._agent_runtime_client is None:
@@ -534,6 +572,7 @@ class ConversationLoopRunner:
                 participant=participant,
                 required_citation_ids=required_citation_ids,
                 context_packet=context_packet,
+                steering_instruction=steering_instruction,
             )
             runtime_result = self._agent_runtime_client.run_agent(
                 RunAgentClientInput(
@@ -557,6 +596,7 @@ class ConversationLoopRunner:
                 {
                     "generator": "agent_runtime",
                     "agent_key": agent_key,
+                    "steering_instruction": steering_instruction,
                     "run_id": runtime_result.run_id,
                     "selected_model": runtime_result.selected_model,
                     "token_in": runtime_result.token_in,
@@ -567,9 +607,14 @@ class ConversationLoopRunner:
             )
 
         content_text = f"[loop-v1] turn {turn_index} by {participant.display_name}"
+        if steering_instruction and participant.kind == "ai":
+            content_text += f" | steer: {steering_instruction}"
         if participant.kind == "ai" and required_citation_ids:
             content_text += f" [chunk:{required_citation_ids[0]}]"
-        return content_text, {"generator": "deterministic"}
+        return content_text, {
+            "generator": "deterministic",
+            "steering_instruction": steering_instruction,
+        }
 
     def _resolve_agent_key(self, participant: ParticipantRecord) -> str:
         normalized = participant.display_name.lower()
@@ -584,6 +629,7 @@ class ConversationLoopRunner:
         participant: ParticipantRecord,
         required_citation_ids: list[UUID],
         context_packet: dict[str, Any],
+        steering_instruction: str | None,
     ) -> str:
         topic = context_packet.get("topic_label") or context_packet.get("topic_summary")
         topic_text = str(topic) if topic else "general"
@@ -596,5 +642,27 @@ class ConversationLoopRunner:
             f"Objective: {objective or 'N/A'}\n"
             f"Speaker: {participant.display_name}\n"
             f"Topic: {topic_text}\n"
+            f"Steering: {steering_instruction or 'none'}\n"
             f"Instruction: Provide one grounded turn. {citation_rule}"
         )
+
+    def _build_alignment_keywords(
+        self,
+        *,
+        objective: str,
+        topic_label: Any,
+        topic_summary: Any,
+        steering_instruction: str | None,
+    ) -> set[str]:
+        keywords: set[str] = set()
+        for text in (
+            objective,
+            str(topic_label or ""),
+            str(topic_summary or ""),
+            steering_instruction or "",
+        ):
+            for token in text.lower().split():
+                cleaned = token.strip(".,:;!?()[]{}\"'`")
+                if len(cleaned) >= 3:
+                    keywords.add(cleaned)
+        return keywords

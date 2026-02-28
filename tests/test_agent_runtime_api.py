@@ -60,3 +60,18 @@ def test_run_agent_endpoint_uses_requested_model() -> None:
 
     assert response.status_code == 200
     assert response.json()["selected_model"] == "custom-model"
+
+
+def test_run_agent_endpoint_rejects_viewer_role() -> None:
+    client = TestClient(agent_runtime_app_module.app)
+
+    response = client.post(
+        "/internal/agents/run",
+        headers={"x-internal-role": "viewer"},
+        json={
+            "agent_key": "ai_1",
+            "prompt": "test",
+        },
+    )
+
+    assert response.status_code == 403

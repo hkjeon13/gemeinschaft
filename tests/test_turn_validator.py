@@ -97,3 +97,42 @@ def test_validator_accepts_human_without_citation_requirement() -> None:
 
     assert result.is_valid is True
     assert result.failure_type is None
+
+
+def test_validator_rejects_topic_derailment_when_alignment_required() -> None:
+    validator = TurnValidator()
+
+    result = validator.validate(
+        TurnValidationInput(
+            participant_kind="ai",
+            content_text="generic answer without topic hints",
+            require_citations=False,
+            allowed_citation_ids=set(),
+            recent_turn_texts=[],
+            require_topic_alignment=True,
+            topic_keywords={"refund", "policy"},
+            min_topic_keyword_matches=1,
+        )
+    )
+
+    assert result.is_valid is False
+    assert result.failure_type == "topic_derailment"
+
+
+def test_validator_accepts_topic_aligned_ai_turn() -> None:
+    validator = TurnValidator()
+
+    result = validator.validate(
+        TurnValidationInput(
+            participant_kind="ai",
+            content_text="refund policy requires receipt",
+            require_citations=False,
+            allowed_citation_ids=set(),
+            recent_turn_texts=[],
+            require_topic_alignment=True,
+            topic_keywords={"refund", "policy"},
+            min_topic_keyword_matches=2,
+        )
+    )
+
+    assert result.is_valid is True

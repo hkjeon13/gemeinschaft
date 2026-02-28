@@ -28,6 +28,10 @@ class InvalidExportStorageKeyError(RuntimeError):
     """Raised when export storage key is outside configured export root."""
 
 
+class DatasetVersionNotFoundError(RuntimeError):
+    """Raised when requested dataset version is missing."""
+
+
 @dataclass(frozen=True)
 class CreateExportJobInput:
     tenant_id: UUID
@@ -64,6 +68,12 @@ class DatasetVersionRecord:
     row_count: int
     manifest: dict[str, Any]
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class ConversationScopeRecord:
+    tenant_id: UUID
+    workspace_id: UUID
 
 
 class ExportRepository:
@@ -206,61 +216,158 @@ class ExportRepository:
             if row is None:
                 raise ExportJobNotFoundError(f"Export job {export_job_id} not found")
 
-        return ExportJobRecord(
-            job_id=row[0],
-            tenant_id=row[1],
-            workspace_id=row[2],
-            conversation_id=row[3],
-            export_format=row[4],
-            status=row[5],
-            storage_key=row[6],
-            row_count=int(row[7]),
-            manifest=row[8],
-            requested_by_user_id=row[9],
-            created_at=row[10],
-            completed_at=row[11],
-        )
+        return self._to_export_job_record(row)
+
+    def list_export_jobs(
+        self,
+        *,
+        conversation_id: UUID,
+        limit: int = 20,
+        before_created_at: datetime | None = None,
+        before_job_id: UUID | None = None,
+    ) -> list[ExportJobRecord]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if (before_created_at is None) != (before_job_id is None):
+            raise ValueError(
+                "before_created_at and before_job_id must be provided together"
+            )
+
+        with self._connection.cursor() as cursor:
+            if before_created_at is None:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        tenant_id,
+                        workspace_id,
+                        conversation_id,
+                        format,
+                        status,
+                        storage_key,
+                        row_count,
+                        manifest,
+                        requested_by_user_id,
+                        created_at,
+                        completed_at
+                    FROM export_job
+                    WHERE conversation_id = %s
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (str(conversation_id), limit),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        tenant_id,
+                        workspace_id,
+                        conversation_id,
+                        format,
+                        status,
+                        storage_key,
+                        row_count,
+                        manifest,
+                        requested_by_user_id,
+                        created_at,
+                        completed_at
+                    FROM export_job
+                    WHERE
+                        conversation_id = %s
+                        AND (
+                            created_at < %s
+                            OR (created_at = %s AND id < %s)
+                        )
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (
+                        str(conversation_id),
+                        before_created_at,
+                        before_created_at,
+                        str(before_job_id),
+                        limit,
+                    ),
+                )
+            rows = cursor.fetchall()
+
+        return [self._to_export_job_record(row) for row in rows]
 
     def read_export_artifact(self, export_job_id: UUID) -> tuple[ExportJobRecord, bytes]:
         record = self.get_export_job(export_job_id)
-        artifact_path = Path(record.storage_key)
-        root = self._export_root.resolve()
-        candidate = artifact_path.resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError as exc:
-            raise InvalidExportStorageKeyError(
-                f"Export storage key is outside export root: {candidate}"
-            ) from exc
-        if not candidate.exists():
-            raise ExportArtifactNotFoundError(f"Export artifact not found: {candidate}")
-        return record, candidate.read_bytes()
+        return record, self._read_artifact_bytes(record.storage_key)
 
-    def list_dataset_versions(
-        self, *, conversation_id: UUID, limit: int = 20
-    ) -> list[DatasetVersionRecord]:
-        if limit < 1:
-            raise ValueError("limit must be >= 1")
+    def get_conversation_scope(self, conversation_id: UUID) -> ConversationScopeRecord:
         with self._connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT
-                    id,
-                    conversation_id,
-                    version_no,
-                    export_job_id,
-                    format,
-                    storage_key,
-                    row_count,
-                    manifest,
-                    created_at
-                FROM conversation_dataset_version
-                WHERE conversation_id = %s
-                ORDER BY version_no DESC
-                LIMIT %s
+                SELECT tenant_id, workspace_id
+                FROM conversation
+                WHERE id = %s
                 """,
-                (str(conversation_id), limit),
+                (str(conversation_id),),
             )
+            row = cursor.fetchone()
+            if row is None:
+                raise ConversationForExportNotFoundError(
+                    f"Conversation {conversation_id} not found"
+                )
+        return ConversationScopeRecord(tenant_id=row[0], workspace_id=row[1])
+
+    def list_dataset_versions(
+        self,
+        *,
+        conversation_id: UUID,
+        limit: int = 20,
+        before_version_no: int | None = None,
+    ) -> list[DatasetVersionRecord]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        if before_version_no is not None and before_version_no < 1:
+            raise ValueError("before_version_no must be >= 1")
+        with self._connection.cursor() as cursor:
+            if before_version_no is None:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        conversation_id,
+                        version_no,
+                        export_job_id,
+                        format,
+                        storage_key,
+                        row_count,
+                        manifest,
+                        created_at
+                    FROM conversation_dataset_version
+                    WHERE conversation_id = %s
+                    ORDER BY version_no DESC
+                    LIMIT %s
+                    """,
+                    (str(conversation_id), limit),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT
+                        id,
+                        conversation_id,
+                        version_no,
+                        export_job_id,
+                        format,
+                        storage_key,
+                        row_count,
+                        manifest,
+                        created_at
+                    FROM conversation_dataset_version
+                    WHERE conversation_id = %s AND version_no < %s
+                    ORDER BY version_no DESC
+                    LIMIT %s
+                    """,
+                    (str(conversation_id), before_version_no, limit),
+                )
             rows = cursor.fetchall()
 
         return [
@@ -277,6 +384,98 @@ class ExportRepository:
             )
             for row in rows
         ]
+
+    def get_dataset_version(
+        self, *, conversation_id: UUID, version_no: int
+    ) -> DatasetVersionRecord:
+        if version_no < 1:
+            raise ValueError("version_no must be >= 1")
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    conversation_id,
+                    version_no,
+                    export_job_id,
+                    format,
+                    storage_key,
+                    row_count,
+                    manifest,
+                    created_at
+                FROM conversation_dataset_version
+                WHERE conversation_id = %s AND version_no = %s
+                """,
+                (str(conversation_id), version_no),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise DatasetVersionNotFoundError(
+                    f"Dataset version {version_no} not found for conversation "
+                    f"{conversation_id}"
+                )
+        return DatasetVersionRecord(
+            dataset_version_id=row[0],
+            conversation_id=row[1],
+            version_no=int(row[2]),
+            export_job_id=row[3],
+            export_format=row[4],
+            storage_key=row[5],
+            row_count=int(row[6]),
+            manifest=row[7],
+            created_at=row[8],
+        )
+
+    def get_latest_dataset_version(self, *, conversation_id: UUID) -> DatasetVersionRecord:
+        with self._connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    conversation_id,
+                    version_no,
+                    export_job_id,
+                    format,
+                    storage_key,
+                    row_count,
+                    manifest,
+                    created_at
+                FROM conversation_dataset_version
+                WHERE conversation_id = %s
+                ORDER BY version_no DESC
+                LIMIT 1
+                """,
+                (str(conversation_id),),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise DatasetVersionNotFoundError(
+                    f"No dataset versions found for conversation {conversation_id}"
+                )
+        return DatasetVersionRecord(
+            dataset_version_id=row[0],
+            conversation_id=row[1],
+            version_no=int(row[2]),
+            export_job_id=row[3],
+            export_format=row[4],
+            storage_key=row[5],
+            row_count=int(row[6]),
+            manifest=row[7],
+            created_at=row[8],
+        )
+
+    def read_dataset_version_artifact(
+        self, *, conversation_id: UUID, version_no: int | None = None
+    ) -> tuple[DatasetVersionRecord, bytes]:
+        record = (
+            self.get_latest_dataset_version(conversation_id=conversation_id)
+            if version_no is None
+            else self.get_dataset_version(
+                conversation_id=conversation_id,
+                version_no=version_no,
+            )
+        )
+        return record, self._read_artifact_bytes(record.storage_key)
 
     def _load_conversation_meta(
         self, cursor: Any, payload: CreateExportJobInput
@@ -450,3 +649,33 @@ class ExportRepository:
         for row in rows:
             writer.writerow(row)
         return output.getvalue()
+
+    def _read_artifact_bytes(self, storage_key: str) -> bytes:
+        artifact_path = Path(storage_key)
+        root = self._export_root.resolve()
+        candidate = artifact_path.resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise InvalidExportStorageKeyError(
+                f"Export storage key is outside export root: {candidate}"
+            ) from exc
+        if not candidate.exists():
+            raise ExportArtifactNotFoundError(f"Export artifact not found: {candidate}")
+        return candidate.read_bytes()
+
+    def _to_export_job_record(self, row: Any) -> ExportJobRecord:
+        return ExportJobRecord(
+            job_id=row[0],
+            tenant_id=row[1],
+            workspace_id=row[2],
+            conversation_id=row[3],
+            export_format=row[4],
+            status=row[5],
+            storage_key=row[6],
+            row_count=int(row[7]),
+            manifest=row[8],
+            requested_by_user_id=row[9],
+            created_at=row[10],
+            completed_at=row[11],
+        )

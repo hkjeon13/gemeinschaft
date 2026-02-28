@@ -13,6 +13,7 @@ import pytest
 from services.export_service.repository import (
     ConversationForExportNotFoundError,
     CreateExportJobInput,
+    DatasetVersionNotFoundError,
     ExportArtifactNotFoundError,
     ExportJobNotFoundError,
     ExportRepository,
@@ -26,6 +27,7 @@ class FakeConnection:
         *,
         conversation_row: tuple[Any, ...] | None,
         message_rows: list[tuple[Any, ...]],
+        conversation_scope_row: tuple[Any, ...] | None = None,
         export_job_row: tuple[Any, ...] | None = None,
         initial_event_seq: int = 0,
         initial_dataset_version_no: int = 0,
@@ -33,6 +35,7 @@ class FakeConnection:
     ):
         self.conversation_row = conversation_row
         self.message_rows = message_rows
+        self.conversation_scope_row = conversation_scope_row
         self.export_job_row = export_job_row
         self.initial_event_seq = initial_event_seq
         self.initial_dataset_version_no = initial_dataset_version_no
@@ -75,6 +78,26 @@ class FakeConnection:
         ) in normalized_sql:
             self._last_fetchone = (self.initial_dataset_version_no,)
             return
+        if (
+            "from conversation_dataset_version where conversation_id = %s "
+            "and version_no = %s"
+        ) in normalized_sql:
+            assert params is not None
+            target_version = int(params[1])
+            self._last_fetchone = None
+            for row in self.dataset_version_rows:
+                if int(row[2]) == target_version:
+                    self._last_fetchone = row
+                    break
+            return
+        if (
+            "from conversation_dataset_version where conversation_id = %s "
+            "order by version_no desc limit 1"
+        ) in normalized_sql:
+            self._last_fetchone = (
+                self.dataset_version_rows[0] if self.dataset_version_rows else None
+            )
+            return
         if "from conversation_dataset_version where conversation_id = %s" in normalized_sql:
             self._last_fetchall = self.dataset_version_rows
             return
@@ -115,6 +138,9 @@ class FakeConnection:
         if "from export_job where id = %s" in normalized_sql:
             self._last_fetchone = self.export_job_row
             return
+        if "select tenant_id, workspace_id from conversation where id = %s" in normalized_sql:
+            self._last_fetchone = self.conversation_scope_row
+            return
         raise AssertionError(f"Unexpected SQL in fake: {normalized_sql}")
 
     def fetchone(self) -> Any:
@@ -128,6 +154,35 @@ class FakeConnection:
 
     def rollback(self) -> None:
         self.rollback_calls += 1
+
+
+class FakeExportJobListConnection:
+    def __init__(self, rows: list[tuple[Any, ...]]):
+        self.rows = rows
+        self._last_fetchall: list[Any] = []
+        self.last_sql: str | None = None
+        self.last_params: tuple[Any, ...] | None = None
+
+    def cursor(self) -> "FakeExportJobListConnection":
+        return self
+
+    def __enter__(self) -> "FakeExportJobListConnection":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        return None
+
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> None:
+        normalized_sql = " ".join(sql.lower().split())
+        if "from export_job" in normalized_sql and "where conversation_id = %s" in normalized_sql:
+            self.last_sql = normalized_sql
+            self.last_params = params
+            self._last_fetchall = self.rows
+            return
+        raise AssertionError(f"Unexpected SQL in fake list connection: {normalized_sql}")
+
+    def fetchall(self) -> list[Any]:
+        return self._last_fetchall
 
 
 def _conversation_row(conversation_id: Any) -> tuple[Any, ...]:
@@ -364,6 +419,130 @@ def test_get_export_job_raises_when_missing(tmp_path: Path) -> None:
         repository.get_export_job(uuid4())
 
 
+def test_get_conversation_scope_returns_scope(tmp_path: Path) -> None:
+    tenant_id = uuid4()
+    workspace_id = uuid4()
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        conversation_scope_row=(tenant_id, workspace_id),
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    scope = repository.get_conversation_scope(uuid4())
+
+    assert scope.tenant_id == tenant_id
+    assert scope.workspace_id == workspace_id
+
+
+def test_get_conversation_scope_raises_when_missing(tmp_path: Path) -> None:
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        conversation_scope_row=None,
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    with pytest.raises(ConversationForExportNotFoundError):
+        repository.get_conversation_scope(uuid4())
+
+
+def test_list_export_jobs_returns_rows(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    tenant_id = uuid4()
+    workspace_id = uuid4()
+    ts_latest = datetime(2026, 2, 27, 21, 44, tzinfo=timezone.utc)
+    ts_old = datetime(2026, 2, 27, 21, 43, tzinfo=timezone.utc)
+    rows = [
+        (
+            uuid4(),
+            tenant_id,
+            workspace_id,
+            conversation_id,
+            "jsonl",
+            "completed",
+            str(tmp_path / "latest.jsonl"),
+            3,
+            {"schema_version": "dataset.v1"},
+            None,
+            ts_latest,
+            ts_latest,
+        ),
+        (
+            uuid4(),
+            tenant_id,
+            workspace_id,
+            conversation_id,
+            "csv",
+            "completed",
+            str(tmp_path / "old.csv"),
+            2,
+            {"schema_version": "dataset.v1"},
+            None,
+            ts_old,
+            ts_old,
+        ),
+    ]
+    repository = ExportRepository(
+        connection=FakeExportJobListConnection(rows),
+        export_root=tmp_path,
+    )
+
+    result = repository.list_export_jobs(conversation_id=conversation_id, limit=20)
+
+    assert len(result) == 2
+    assert result[0].conversation_id == conversation_id
+    assert result[0].row_count == 3
+    assert result[1].export_format == "csv"
+
+
+def test_list_export_jobs_invalid_limit(tmp_path: Path) -> None:
+    repository = ExportRepository(
+        connection=FakeExportJobListConnection([]),
+        export_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError):
+        repository.list_export_jobs(conversation_id=uuid4(), limit=0)
+
+
+def test_list_export_jobs_applies_cursor_filter(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    before_created_at = datetime(2026, 2, 27, 21, 44, tzinfo=timezone.utc)
+    before_job_id = uuid4()
+    connection = FakeExportJobListConnection([])
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    repository.list_export_jobs(
+        conversation_id=conversation_id,
+        limit=10,
+        before_created_at=before_created_at,
+        before_job_id=before_job_id,
+    )
+
+    assert connection.last_sql is not None
+    assert "created_at < %s or (created_at = %s and id < %s)" in connection.last_sql
+    assert connection.last_params is not None
+    assert connection.last_params[1] == before_created_at
+    assert connection.last_params[2] == before_created_at
+    assert connection.last_params[3] == str(before_job_id)
+
+
+def test_list_export_jobs_rejects_partial_cursor(tmp_path: Path) -> None:
+    repository = ExportRepository(
+        connection=FakeExportJobListConnection([]),
+        export_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError):
+        repository.list_export_jobs(
+            conversation_id=uuid4(),
+            limit=10,
+            before_created_at=datetime(2026, 2, 27, 21, 44, tzinfo=timezone.utc),
+            before_job_id=None,
+        )
+
+
 def test_list_dataset_versions_returns_ordered_rows(tmp_path: Path) -> None:
     conversation_id = uuid4()
     ts = datetime(2026, 2, 27, 21, 45, tzinfo=timezone.utc)
@@ -417,6 +596,130 @@ def test_list_dataset_versions_rejects_invalid_limit(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         repository.list_dataset_versions(conversation_id=uuid4(), limit=0)
+
+
+def test_get_dataset_version_returns_specific_row(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    ts = datetime(2026, 2, 27, 21, 46, tzinfo=timezone.utc)
+    row_v3 = (
+        uuid4(),
+        conversation_id,
+        3,
+        uuid4(),
+        "jsonl",
+        str(tmp_path / "v3.jsonl"),
+        10,
+        {"dataset_version_no": 3},
+        ts,
+    )
+    row_v2 = (
+        uuid4(),
+        conversation_id,
+        2,
+        uuid4(),
+        "csv",
+        str(tmp_path / "v2.csv"),
+        9,
+        {"dataset_version_no": 2},
+        ts,
+    )
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=None,
+        dataset_version_rows=[row_v3, row_v2],
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    record = repository.get_dataset_version(conversation_id=conversation_id, version_no=2)
+
+    assert record.version_no == 2
+    assert record.export_format == "csv"
+
+
+def test_get_dataset_version_raises_when_missing(tmp_path: Path) -> None:
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=None,
+        dataset_version_rows=[],
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    with pytest.raises(DatasetVersionNotFoundError):
+        repository.get_dataset_version(conversation_id=uuid4(), version_no=1)
+
+
+def test_get_latest_dataset_version_returns_top_row(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    ts = datetime(2026, 2, 27, 21, 47, tzinfo=timezone.utc)
+    row_v4 = (
+        uuid4(),
+        conversation_id,
+        4,
+        uuid4(),
+        "jsonl",
+        str(tmp_path / "v4.jsonl"),
+        11,
+        {"dataset_version_no": 4},
+        ts,
+    )
+    row_v3 = (
+        uuid4(),
+        conversation_id,
+        3,
+        uuid4(),
+        "csv",
+        str(tmp_path / "v3.csv"),
+        10,
+        {"dataset_version_no": 3},
+        ts,
+    )
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=None,
+        dataset_version_rows=[row_v4, row_v3],
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    record = repository.get_latest_dataset_version(conversation_id=conversation_id)
+
+    assert record.version_no == 4
+    assert record.manifest["dataset_version_no"] == 4
+
+
+def test_read_dataset_version_artifact_uses_latest_when_unspecified(tmp_path: Path) -> None:
+    conversation_id = uuid4()
+    export_path = tmp_path / "v5.jsonl"
+    export_path.write_text('{"v":5}\n', encoding="utf-8")
+    ts = datetime(2026, 2, 27, 21, 48, tzinfo=timezone.utc)
+    row_v5 = (
+        uuid4(),
+        conversation_id,
+        5,
+        uuid4(),
+        "jsonl",
+        str(export_path),
+        12,
+        {"dataset_version_no": 5},
+        ts,
+    )
+    connection = FakeConnection(
+        conversation_row=None,
+        message_rows=[],
+        export_job_row=None,
+        dataset_version_rows=[row_v5],
+    )
+    repository = ExportRepository(connection=connection, export_root=tmp_path)
+
+    record, content = repository.read_dataset_version_artifact(
+        conversation_id=conversation_id,
+        version_no=None,
+    )
+
+    assert record.version_no == 5
+    assert content == b'{"v":5}\n'
 
 
 def test_read_export_artifact_returns_bytes(tmp_path: Path) -> None:

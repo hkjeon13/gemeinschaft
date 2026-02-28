@@ -33,6 +33,7 @@ class FakeConnection:
         initial_turn_index: int = 0,
         initial_seq_no: int = 0,
         recent_turn_texts: list[str] | None = None,
+        latest_steering_instruction: str | None = None,
     ):
         self.conversation_exists = conversation_exists
         self.conversation_status = conversation_status
@@ -40,6 +41,7 @@ class FakeConnection:
         self.initial_turn_index = initial_turn_index
         self.initial_seq_no = initial_seq_no
         self.recent_turn_texts = recent_turn_texts or []
+        self.latest_steering_instruction = latest_steering_instruction
         self.commit_calls = 0
         self.rollback_calls = 0
         self._last_fetchone: Any = None
@@ -52,6 +54,7 @@ class FakeConnection:
         self.inserted_message_metadata: list[dict[str, Any]] = []
         self.inserted_event_types: list[str] = []
         self.updated_status: str | None = None
+        self.participant_query_sql: str | None = None
 
     def cursor(self) -> "FakeConnection":
         return self
@@ -72,6 +75,7 @@ class FakeConnection:
             )
             return
         if "select id, kind, display_name from participant" in normalized_sql:
+            self.participant_query_sql = normalized_sql
             self._last_fetchall = self.participants
             return
         if "select coalesce(max(turn_index), 0) from message" in normalized_sql:
@@ -79,6 +83,13 @@ class FakeConnection:
             return
         if "select coalesce(max(seq_no), 0) from event" in normalized_sql:
             self._last_fetchone = (self.initial_seq_no,)
+            return
+        if "select payload ->> 'instruction' from event" in normalized_sql:
+            self._last_fetchone = (
+                (self.latest_steering_instruction,)
+                if self.latest_steering_instruction is not None
+                else None
+            )
             return
         if "select content_text from message" in normalized_sql:
             self._last_fetchall = [(text,) for text in self.recent_turn_texts]
@@ -272,12 +283,70 @@ def test_loop_runner_rejects_no_participants() -> None:
     assert connection.rollback_calls == 1
 
 
+def test_loop_runner_filters_muted_participants_in_query() -> None:
+    participant_a = (uuid4(), "ai", "AI(1)")
+    connection = FakeConnection(
+        conversation_exists=True,
+        participants=[participant_a],
+    )
+    runner = ConversationLoopRunner(connection)
+
+    runner.run_loop(RunLoopInput(conversation_id=uuid4(), max_turns=1))
+
+    assert connection.participant_query_sql is not None
+    assert "coalesce(metadata #>> '{moderation,muted}', 'false') <> 'true'" in (
+        connection.participant_query_sql
+    )
+
+
+def test_loop_runner_rejects_topic_derailment_when_guard_enabled() -> None:
+    participant_a = (uuid4(), "ai", "AI(1)")
+    connection = FakeConnection(
+        conversation_exists=True,
+        participants=[participant_a],
+    )
+    runner = ConversationLoopRunner(connection)
+
+    result = runner.run_loop(
+        RunLoopInput(
+            conversation_id=uuid4(),
+            max_turns=1,
+            derailment_guard_enabled=True,
+        )
+    )
+
+    assert result.turns_created == 0
+    assert result.turns_rejected == 1
+    assert connection.inserted_message_statuses == ["rejected"]
+    assert connection.inserted_message_metadata[0]["validation"]["failure_type"] == (
+        "topic_derailment"
+    )
+    assert connection.inserted_event_types == ["turn.rejected"]
+    assert connection.updated_status == "paused"
+
+
 def test_loop_runner_rejects_invalid_turn_count() -> None:
     connection = FakeConnection(conversation_exists=True, participants=[])
     runner = ConversationLoopRunner(connection)
 
     with pytest.raises(ValueError):
         runner.run_loop(RunLoopInput(conversation_id=uuid4(), max_turns=0))
+
+
+def test_loop_runner_rejects_invalid_topic_keyword_match_threshold() -> None:
+    participant_a = (uuid4(), "ai", "AI(1)")
+    connection = FakeConnection(conversation_exists=True, participants=[participant_a])
+    runner = ConversationLoopRunner(connection)
+
+    with pytest.raises(ValueError):
+        runner.run_loop(
+            RunLoopInput(
+                conversation_id=uuid4(),
+                max_turns=1,
+                derailment_guard_enabled=True,
+                min_topic_keyword_matches=0,
+            )
+        )
 
 
 class FakeAgentRuntimeClient:
@@ -532,3 +601,54 @@ def test_loop_runner_requests_arbitration_on_disjoint_ai_citations() -> None:
         "conversation.paused",
     ]
     assert connection.updated_status == "paused"
+
+
+def test_loop_runner_injects_steering_instruction_into_runtime_prompt() -> None:
+    participant_ai = (uuid4(), "ai", "AI(1)")
+    connection = FakeConnection(
+        conversation_exists=True,
+        participants=[participant_ai],
+        initial_turn_index=0,
+        initial_seq_no=0,
+        latest_steering_instruction="Focus on fraud checks first",
+    )
+    runtime = FakeAgentRuntimeClient()
+    runner = ConversationLoopRunner(connection, agent_runtime_client=runtime)
+
+    result = runner.run_loop(
+        RunLoopInput(
+            conversation_id=uuid4(),
+            max_turns=1,
+            use_agent_runtime=True,
+        )
+    )
+
+    assert result.turns_attempted == 1
+    assert len(runtime.calls) == 1
+    assert "Steering: Focus on fraud checks first" in runtime.calls[0].prompt
+    assert (
+        connection.inserted_message_metadata[0]["generation"]["steering_instruction"]
+        == "Focus on fraud checks first"
+    )
+
+
+def test_loop_runner_injects_steering_instruction_into_deterministic_turn() -> None:
+    participant_ai = (uuid4(), "ai", "AI(1)")
+    connection = FakeConnection(
+        conversation_exists=True,
+        participants=[participant_ai],
+        initial_turn_index=0,
+        initial_seq_no=0,
+        latest_steering_instruction="Use compliance angle",
+    )
+    runner = ConversationLoopRunner(connection)
+
+    result = runner.run_loop(
+        RunLoopInput(
+            conversation_id=uuid4(),
+            max_turns=1,
+        )
+    )
+
+    assert result.turns_attempted == 1
+    assert "steer: Use compliance angle" in connection.inserted_content_texts[0]

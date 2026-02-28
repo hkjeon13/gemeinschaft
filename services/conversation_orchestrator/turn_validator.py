@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 _CITATION_PATTERN = re.compile(r"\[(?:chunk|cite):([0-9a-fA-F-]{36})\]")
@@ -16,6 +16,9 @@ class TurnValidationInput:
     require_citations: bool
     allowed_citation_ids: set[str]
     recent_turn_texts: list[str]
+    require_topic_alignment: bool = False
+    topic_keywords: set[str] = field(default_factory=set)
+    min_topic_keyword_matches: int = 1
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,30 @@ class TurnValidator:
                     reasons=[f"citation not in allowed evidence set: {unknown[0]}"],
                     citations=citations,
                 )
+
+        if payload.participant_kind == "ai" and payload.require_topic_alignment:
+            required_matches = max(payload.min_topic_keyword_matches, 1)
+            normalized_content_for_match = self._normalize(normalized_content)
+            normalized_keywords = {
+                self._normalize(keyword)
+                for keyword in payload.topic_keywords
+                if self._normalize(keyword)
+            }
+            if normalized_keywords:
+                match_count = sum(
+                    1
+                    for keyword in normalized_keywords
+                    if keyword in normalized_content_for_match
+                )
+                if match_count < required_matches:
+                    return TurnValidationResult(
+                        is_valid=False,
+                        failure_type="topic_derailment",
+                        reasons=[
+                            "ai turn does not sufficiently align with objective/topic keywords"
+                        ],
+                        citations=citations,
+                    )
 
         return TurnValidationResult(
             is_valid=True,

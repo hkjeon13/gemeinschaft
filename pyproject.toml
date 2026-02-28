@@ -11,6 +11,7 @@ dependencies = [
   "fastapi>=0.115,<1.0",
   "python-multipart>=0.0.9,<1.0",
   "psycopg[binary]>=3.2,<4.0",
+  "psycopg-pool>=3.2,<4.0",
   "uvicorn>=0.30,<1.0",
 ]
 
@@ -27,3 +28,4 @@ include = ["services*", "scripts*"]
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
+asyncio_default_fixture_loop_scope = "function"

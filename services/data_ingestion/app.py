@@ -6,12 +6,12 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import File, Form, HTTPException, UploadFile
+from fastapi import File, Form, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel
 
 from services.data_ingestion.embedding_worker import EmbedSourceResult, EmbeddingWorker
@@ -25,10 +25,14 @@ from services.data_ingestion.processing_repository import IngestionProcessingRep
 from services.data_ingestion.source_repository import (
     CreateSourceInput,
     CreateSourceResult,
+    SourceListRecord,
     SourceRepository,
 )
+from services.data_ingestion.source_scope_service import SourceScopeService
 from services.data_ingestion.topic_worker import TopicSourceResult, TopicWorker
 from services.shared.app_factory import build_service_app
+from services.shared.auth import enforce_role, enforce_scope, get_auth_context
+from services.shared.db import get_db_connection
 
 app = build_service_app("data_ingestion")
 
@@ -72,18 +76,32 @@ class ClusterTopicsResponse(BaseModel):
     error_message: str | None = None
 
 
+class SourceSummaryResponse(BaseModel):
+    source_id: UUID
+    tenant_id: UUID
+    workspace_id: UUID
+    source_type: str
+    original_filename: str
+    content_type: str | None
+    byte_size: int
+    checksum_sha256: str
+    storage_provider: str
+    storage_key: str
+    metadata: dict[str, Any]
+    created_at: datetime
+
+
+class SourcePageResponse(BaseModel):
+    items: list[SourceSummaryResponse]
+    next_cursor: str | None
+    has_more: bool
+
+
 def _connect() -> Any:
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise HTTPException(
-            status_code=500,
-            detail="DATABASE_URL is not configured",
-        )
     try:
-        import psycopg  # type: ignore
-    except ModuleNotFoundError as exc:  # pragma: no cover - runtime guard
-        raise HTTPException(status_code=500, detail="psycopg is not installed") from exc
-    return psycopg.connect(database_url)
+        return get_db_connection("data_ingestion")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 def _build_storage() -> ObjectStorage:
@@ -182,14 +200,104 @@ def _build_storage_key(
     return f"{tenant_id}/{workspace_id}/{source_id}/{filename}"
 
 
+def _authorize(
+    request: Request,
+    *,
+    allowed_roles: set[str] | None = None,
+    tenant_id: UUID | None = None,
+    workspace_id: UUID | None = None,
+) -> None:
+    auth = get_auth_context(request)
+    if allowed_roles is not None:
+        enforce_role(auth, allowed_roles=allowed_roles)
+    enforce_scope(auth, tenant_id=tenant_id, workspace_id=workspace_id)
+
+
+def _authorize_source(
+    request: Request,
+    *,
+    source_id: UUID,
+    allowed_roles: set[str],
+) -> None:
+    _authorize(request, allowed_roles=allowed_roles)
+    auth = get_auth_context(request)
+    if auth.tenant_id is None and auth.workspace_id is None:
+        return
+
+    connection = _connect()
+    scope_service = SourceScopeService(connection)
+    try:
+        scope = scope_service.get_scope(source_id)
+    except SourceNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    enforce_scope(auth, tenant_id=scope.tenant_id, workspace_id=scope.workspace_id)
+
+
+def _to_source_summary_response(record: SourceListRecord) -> SourceSummaryResponse:
+    return SourceSummaryResponse(
+        source_id=record.source_id,
+        tenant_id=record.tenant_id,
+        workspace_id=record.workspace_id,
+        source_type=record.source_type,
+        original_filename=record.original_filename,
+        content_type=record.content_type,
+        byte_size=record.byte_size,
+        checksum_sha256=record.checksum_sha256,
+        storage_provider=record.storage_provider,
+        storage_key=record.storage_key,
+        metadata=record.metadata,
+        created_at=record.created_at,
+    )
+
+
+def _parse_source_cursor(cursor: str | None) -> tuple[datetime | None, UUID | None]:
+    if cursor is None or not cursor.strip():
+        return None, None
+    token = cursor.strip()
+    prefix = "s:"
+    if not token.startswith(prefix):
+        raise HTTPException(status_code=400, detail="cursor must start with 's:'")
+    parts = token[len(prefix) :].split("|", 1)
+    if len(parts) != 2:
+        raise HTTPException(status_code=400, detail="cursor must be '<created_at>|<source_id>'")
+    created_at_raw, source_id_raw = parts[0], parts[1]
+    try:
+        created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="cursor created_at is invalid") from exc
+    if created_at.tzinfo is None:
+        raise HTTPException(status_code=400, detail="cursor created_at must include timezone")
+    try:
+        source_id = UUID(source_id_raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="cursor source_id is invalid") from exc
+    return created_at, source_id
+
+
+def _build_source_cursor(record: SourceListRecord) -> str:
+    created_at_utc = record.created_at.astimezone(timezone.utc)
+    token = created_at_utc.isoformat().replace("+00:00", "Z")
+    return f"s:{token}|{record.source_id}"
+
+
 @app.post("/internal/sources/upload", response_model=UploadSourceResponse, status_code=201)
 async def upload_source(
+    http_request: Request,
     tenant_id: UUID = Form(...),
     workspace_id: UUID = Form(...),
     source_type: str = Form("upload"),
     metadata: str | None = Form(None),
     file: UploadFile = File(...),
 ) -> UploadSourceResponse:
+    _authorize(
+        http_request,
+        allowed_roles={"admin", "operator", "system"},
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
     if source_type not in {"upload", "preloaded", "integration"}:
         raise HTTPException(status_code=400, detail="invalid source_type")
 
@@ -246,8 +354,57 @@ async def upload_source(
     )
 
 
+@app.get("/internal/sources/page", response_model=SourcePageResponse)
+def list_sources_page(
+    http_request: Request,
+    tenant_id: UUID = Query(...),
+    workspace_id: UUID = Query(...),
+    source_type: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+) -> SourcePageResponse:
+    _authorize(
+        http_request,
+        allowed_roles={"admin", "operator", "viewer", "system"},
+        tenant_id=tenant_id,
+        workspace_id=workspace_id,
+    )
+    before_created_at, before_source_id = _parse_source_cursor(cursor)
+    connection = _connect()
+    repository = SourceRepository(connection)
+    try:
+        records: list[SourceListRecord] = repository.list_sources(
+            tenant_id=tenant_id,
+            workspace_id=workspace_id,
+            source_type=source_type,
+            limit=limit + 1,
+            before_created_at=before_created_at,
+            before_source_id=before_source_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        connection.close()
+
+    has_more = len(records) > limit
+    page_records = records[:limit]
+    next_cursor = None
+    if has_more and page_records:
+        next_cursor = _build_source_cursor(page_records[-1])
+    return SourcePageResponse(
+        items=[_to_source_summary_response(record) for record in page_records],
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
+
+
 @app.post("/internal/sources/{source_id}/process", response_model=ProcessSourceResponse)
-def process_source(source_id: UUID) -> ProcessSourceResponse:
+def process_source(source_id: UUID, http_request: Request) -> ProcessSourceResponse:
+    _authorize_source(
+        http_request,
+        source_id=source_id,
+        allowed_roles={"admin", "operator", "system"},
+    )
     connection = _connect()
     try:
         storage = _build_storage()
@@ -269,7 +426,12 @@ def process_source(source_id: UUID) -> ProcessSourceResponse:
 
 
 @app.post("/internal/sources/{source_id}/embed", response_model=EmbedSourceResponse)
-def embed_source(source_id: UUID) -> EmbedSourceResponse:
+def embed_source(source_id: UUID, http_request: Request) -> EmbedSourceResponse:
+    _authorize_source(
+        http_request,
+        source_id=source_id,
+        allowed_roles={"admin", "operator", "system"},
+    )
     connection = _connect()
     try:
         worker = _build_embedding_worker(connection=connection)
@@ -291,7 +453,12 @@ def embed_source(source_id: UUID) -> EmbedSourceResponse:
 
 
 @app.post("/internal/sources/{source_id}/topics", response_model=ClusterTopicsResponse)
-def cluster_source_topics(source_id: UUID) -> ClusterTopicsResponse:
+def cluster_source_topics(source_id: UUID, http_request: Request) -> ClusterTopicsResponse:
+    _authorize_source(
+        http_request,
+        source_id=source_id,
+        allowed_roles={"admin", "operator", "system"},
+    )
     connection = _connect()
     try:
         worker = _build_topic_worker(connection=connection)
