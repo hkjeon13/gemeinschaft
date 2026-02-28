@@ -2,7 +2,9 @@
 
 import { generateDpopProof } from './dpop';
 
-const BASE_URL = 'https://dataset.fin-ally.net/api';
+const configuredBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').trim();
+const BASE_URL = (configuredBaseUrl || 'https://dataset.fin-ally.net/api').replace(/\/+$/, '');
+const CSRF_STORAGE_KEY = 'csrf_token';
 
 // 디버그 모드
 const DEBUG = true;
@@ -11,10 +13,56 @@ interface FetchOptions extends RequestInit {
   skipRefresh?: boolean;
 }
 
+function resolveRequestCredentials(): RequestCredentials {
+  const configured = (import.meta.env.VITE_API_CREDENTIALS ?? '').trim().toLowerCase();
+  if (configured === 'omit' || configured === 'same-origin' || configured === 'include') {
+    return configured;
+  }
+  return 'include';
+}
+
+const REQUEST_CREDENTIALS = resolveRequestCredentials();
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function saveCsrfToken(token: string): void {
+  if (!token) {
+    return;
+  }
+  try {
+    sessionStorage.setItem(CSRF_STORAGE_KEY, token);
+  } catch {
+    // Ignore storage failures in restricted environments.
+  }
+}
+
+function getStoredCsrfToken(): string | null {
+  try {
+    return sessionStorage.getItem(CSRF_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
 // CSRF 토큰 가져오기 (쿠키에서)
 function getCsrfToken(): string | null {
   const match = document.cookie.match(/csrf_token=([^;]+)/);
-  return match ? match[1] : null;
+  if (match?.[1]) {
+    return match[1];
+  }
+  return getStoredCsrfToken();
+}
+
+function captureCsrfToken(payload: unknown): void {
+  if (!isRecord(payload)) {
+    return;
+  }
+  const token = payload.csrf_token;
+  if (typeof token === 'string' && token) {
+    saveCsrfToken(token);
+  }
 }
 
 let isRefreshing = false;
@@ -34,7 +82,7 @@ async function refreshToken(): Promise<boolean> {
 
       const response = await fetch(url, {
         method: 'POST',
-        credentials: 'same-origin',
+        credentials: REQUEST_CREDENTIALS,
         headers: {
           'DPoP': dpopProof,
           'Content-Type': 'application/json',
@@ -42,6 +90,12 @@ async function refreshToken(): Promise<boolean> {
       });
 
       if (response.ok) {
+        try {
+          const payload = await response.json();
+          captureCsrfToken(payload);
+        } catch {
+          // Ignore empty/non-JSON refresh response.
+        }
         return true;
       }
       return false;
@@ -102,7 +156,7 @@ export async function apiRequest<T>(
   try {
     const response = await fetch(url, {
       ...fetchOptions,
-      credentials: 'same-origin',
+      credentials: REQUEST_CREDENTIALS,
       headers,
     });
 
@@ -133,6 +187,7 @@ export async function apiRequest<T>(
     }
 
     const data = await response.json();
+    captureCsrfToken(data);
     if (DEBUG) {
       console.log('[API] Response data:', data);
     }

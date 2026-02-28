@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -57,6 +58,20 @@ def _parse_allowed_origins() -> list[str]:
     return [origin.strip().lower().rstrip("/") for origin in raw.split(",") if origin.strip()]
 
 
+def _origin_regex_pattern() -> str:
+    return os.getenv("AUTH_ALLOWED_ORIGIN_REGEX", "").strip()
+
+
+def _origin_matches_allowed_regex(origin: str, pattern: str) -> bool:
+    try:
+        return re.fullmatch(pattern, origin, flags=re.IGNORECASE) is not None
+    except re.error:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_ALLOWED_ORIGIN_REGEX must be a valid regular expression.",
+        )
+
+
 def _request_external_origin(request: Request) -> str:
     host = request.headers.get("host", "").strip()
     if not host:
@@ -86,10 +101,18 @@ def enforce_origin_for_state_change(request: Request) -> None:
         )
 
     allowed = _parse_allowed_origins()
+    allowed_regex = _origin_regex_pattern()
     if not allowed:
-        allowed = [_request_external_origin(request)]
+        if not allowed_regex:
+            allowed = [_request_external_origin(request)]
 
     if "*" in allowed:
+        return
+
+    if origin in allowed:
+        return
+
+    if allowed_regex and _origin_matches_allowed_regex(origin, allowed_regex):
         return
 
     if origin not in allowed:
@@ -98,6 +121,7 @@ def enforce_origin_for_state_change(request: Request) -> None:
             outcome="deny",
             origin=origin,
             allowed_origins=allowed,
+            allowed_origin_regex=allowed_regex or None,
             path=request.url.path,
             method=request.method,
         )

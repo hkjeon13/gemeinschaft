@@ -1,13 +1,74 @@
 // DPoP (Demonstration of Proof-of-Possession) 구현
 
 let dpopKeyPair: CryptoKeyPair | null = null;
+const DPOP_PRIVATE_JWK_STORAGE_KEY = 'dpop_private_jwk';
+const DPOP_PUBLIC_JWK_STORAGE_KEY = 'dpop_public_jwk';
 
 // 디버그 모드 (개발 시 true로 설정)
 const DEBUG = true;
 
+function clearStoredDpopKeys(): void {
+  try {
+    sessionStorage.removeItem(DPOP_PRIVATE_JWK_STORAGE_KEY);
+    sessionStorage.removeItem(DPOP_PUBLIC_JWK_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures in restricted environments.
+  }
+}
+
+async function restoreDpopKeyPair(): Promise<CryptoKeyPair | null> {
+  try {
+    const storedPrivate = sessionStorage.getItem(DPOP_PRIVATE_JWK_STORAGE_KEY);
+    const storedPublic = sessionStorage.getItem(DPOP_PUBLIC_JWK_STORAGE_KEY);
+    if (!storedPrivate || !storedPublic) {
+      return null;
+    }
+
+    const privateJwk = JSON.parse(storedPrivate) as JsonWebKey;
+    const publicJwk = JSON.parse(storedPublic) as JsonWebKey;
+
+    const privateKey = await crypto.subtle.importKey(
+      'jwk',
+      privateJwk,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      true,
+      ['sign']
+    );
+    const publicKey = await crypto.subtle.importKey(
+      'jwk',
+      publicJwk,
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      true,
+      ['verify']
+    );
+
+    return { privateKey, publicKey };
+  } catch {
+    clearStoredDpopKeys();
+    return null;
+  }
+}
+
+async function persistDpopKeyPair(keyPair: CryptoKeyPair): Promise<void> {
+  try {
+    const privateJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+    const publicJwk = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+    sessionStorage.setItem(DPOP_PRIVATE_JWK_STORAGE_KEY, JSON.stringify(privateJwk));
+    sessionStorage.setItem(DPOP_PUBLIC_JWK_STORAGE_KEY, JSON.stringify(publicJwk));
+  } catch {
+    // Ignore storage failures in restricted environments.
+  }
+}
+
 // DPoP 키 쌍 생성 또는 가져오기
 async function getDpopKeyPair(): Promise<CryptoKeyPair> {
   if (dpopKeyPair) {
+    return dpopKeyPair;
+  }
+
+  const restored = await restoreDpopKeyPair();
+  if (restored) {
+    dpopKeyPair = restored;
     return dpopKeyPair;
   }
 
@@ -20,6 +81,7 @@ async function getDpopKeyPair(): Promise<CryptoKeyPair> {
     true,
     ['sign', 'verify']
   );
+  await persistDpopKeyPair(dpopKeyPair);
 
   return dpopKeyPair;
 }

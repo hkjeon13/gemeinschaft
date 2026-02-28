@@ -30,11 +30,12 @@ from app.services.request_security import enforce_origin_for_state_change, valid
 auth_router = APIRouter()
 
 
-def _session_response(token_pair: dict) -> AuthSessionResponseSchema:
+def _session_response(token_pair: dict, csrf_token: str) -> AuthSessionResponseSchema:
     return AuthSessionResponseSchema(
         token_type=token_pair["token_type"],
         access_expires_in=token_pair["access_expires_in"],
         refresh_expires_in=token_pair["refresh_expires_in"],
+        csrf_token=csrf_token,
     )
 
 
@@ -60,8 +61,8 @@ async def login(payload: LoginRequestSchema, request: Request, response: Respons
         scopes=user.scopes,
         dpop_jkt=validate_dpop_proof(request),
     )
-    attach_auth_cookies(response, token_pair)
-    return _session_response(token_pair)
+    csrf_token = attach_auth_cookies(response, token_pair)
+    return _session_response(token_pair, csrf_token)
 
 
 @auth_router.post("/refresh", response_model=AuthSessionResponseSchema)
@@ -83,8 +84,8 @@ async def refresh(
     validate_dpop_proof(request, expected_jkt=dpop_jkt_from_claims(refresh_claims))
 
     token_pair = rotate_token_pair_from_refresh_token(refresh_token)
-    attach_auth_cookies(response, token_pair)
-    return _session_response(token_pair)
+    csrf_token = attach_auth_cookies(response, token_pair)
+    return _session_response(token_pair, csrf_token)
 
 
 @auth_router.post("/logout")

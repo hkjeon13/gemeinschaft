@@ -16,3 +16,4 @@ class AuthSessionResponseSchema(BaseModel):
     token_type: str
     access_expires_in: int
     refresh_expires_in: int
+    csrf_token: str

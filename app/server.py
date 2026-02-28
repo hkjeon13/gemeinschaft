@@ -28,11 +28,21 @@ def _parse_allowed_origins() -> list[str]:
     return [origin.strip().lower().rstrip("/") for origin in raw.split(",") if origin.strip()]
 
 
+def _parse_allowed_origin_regex() -> str:
+    return os.getenv("AUTH_ALLOWED_ORIGIN_REGEX", "").strip()
+
+
 cors_allowed_origins = _parse_allowed_origins()
-if cors_allowed_origins:
+cors_allowed_origin_regex = _parse_allowed_origin_regex() or None
+if "*" in cors_allowed_origins:
+    cors_allowed_origins = [origin for origin in cors_allowed_origins if origin != "*"]
+    cors_allowed_origin_regex = ".*"
+
+if cors_allowed_origins or cors_allowed_origin_regex:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_allowed_origins,
+        allow_origin_regex=cors_allowed_origin_regex,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

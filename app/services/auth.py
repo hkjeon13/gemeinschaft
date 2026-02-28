@@ -931,8 +931,9 @@ def _cookie_params() -> Dict[str, Any]:
     return params
 
 
-def attach_auth_cookies(response: Response, token_pair: Dict[str, Any]) -> None:
+def attach_auth_cookies(response: Response, token_pair: Dict[str, Any]) -> str:
     params = _cookie_params()
+    csrf_token = new_csrf_token()
     response.set_cookie(
         key=access_cookie_name(),
         value=token_pair["access_token"],
@@ -947,7 +948,7 @@ def attach_auth_cookies(response: Response, token_pair: Dict[str, Any]) -> None:
     )
     response.set_cookie(
         key=csrf_cookie_name(),
-        value=new_csrf_token(),
+        value=csrf_token,
         max_age=token_pair["refresh_expires_in"],
         httponly=False,
         secure=params["secure"],
@@ -955,6 +956,7 @@ def attach_auth_cookies(response: Response, token_pair: Dict[str, Any]) -> None:
         path="/",
         domain=params.get("domain"),
     )
+    return csrf_token
 
 
 def clear_auth_cookies(response: Response) -> None:
