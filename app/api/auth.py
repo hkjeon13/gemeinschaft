@@ -10,6 +10,7 @@ from app.services.auth import (
     authenticate_user,
     create_token_pair,
     ensure_login_not_rate_limited,
+    get_jwks_document,
     login_rate_limit_key,
     register_login_failure,
     register_login_success,
@@ -34,12 +35,24 @@ async def login(payload: LoginRequestSchema, request: Request):
         )
 
     register_login_success(rate_key)
-    return TokenPairResponseSchema(**create_token_pair(subject=user.username, role=user.role))
+    return TokenPairResponseSchema(
+        **create_token_pair(
+            subject=user.username,
+            role=user.role,
+            tenant=user.tenant,
+            scopes=user.scopes,
+        )
+    )
 
 
 @auth_router.post("/refresh", response_model=TokenPairResponseSchema)
 async def refresh(payload: RefreshTokenRequestSchema):
     return TokenPairResponseSchema(**rotate_token_pair_from_refresh_token(payload.refresh_token))
+
+
+@auth_router.get("/.well-known/jwks.json")
+async def jwks():
+    return get_jwks_document()
 
 
 @auth_router.get("/me")
@@ -48,6 +61,8 @@ async def me(jwt_ctx: JwtContext = Depends(require_jwt)):
     return {
         "sub": claims.get("sub"),
         "role": claims.get("role"),
+        "tenant": claims.get("tenant"),
+        "scope": claims.get("scope"),
         "iss": claims.get("iss"),
         "aud": claims.get("aud"),
         "typ": claims.get("typ"),

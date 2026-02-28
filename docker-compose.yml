@@ -10,6 +10,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - ./secrets:/run/secrets:ro
     ports:
       - "${APP_PORT:-8000}:8000"
     environment:
@@ -17,18 +19,23 @@ services:
       APP_PORT: "8000"
       APP_WORKERS: "${APP_WORKERS:-1}"
       GUNICORN_TIMEOUT: "${GUNICORN_TIMEOUT:-500}"
-      JWT_SECRET_KEY: "${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set}"
-      JWT_ALGORITHM: "${JWT_ALGORITHM:-HS256}"
+      JWT_ALGORITHM: "${JWT_ALGORITHM:-RS256}"
       JWT_ISSUER: "${JWT_ISSUER:-gemeinschaft-api}"
       JWT_AUDIENCE: "${JWT_AUDIENCE:-gemeinschaft-clients}"
       JWT_ACCESS_TOKEN_EXPIRES_MINUTES: "${JWT_ACCESS_TOKEN_EXPIRES_MINUTES:-60}"
       JWT_REFRESH_TOKEN_EXPIRES_DAYS: "${JWT_REFRESH_TOKEN_EXPIRES_DAYS:-14}"
+      JWT_PRIVATE_KEYS_FILE: "${JWT_PRIVATE_KEYS_FILE:-/run/secrets/jwt_private_keys.json}"
+      JWT_PUBLIC_KEYS_FILE: "${JWT_PUBLIC_KEYS_FILE:-/run/secrets/jwt_public_keys.json}"
+      JWT_PRIVATE_KEYS_JSON: "${JWT_PRIVATE_KEYS_JSON:-}"
+      JWT_PUBLIC_KEYS_JSON: "${JWT_PUBLIC_KEYS_JSON:-}"
+      JWT_ACTIVE_KID: "${JWT_ACTIVE_KID:-}"
       AUTH_USERS_JSON: "${AUTH_USERS_JSON:?AUTH_USERS_JSON must be set}"
       AUTH_ALLOW_PLAINTEXT_PASSWORDS: "${AUTH_ALLOW_PLAINTEXT_PASSWORDS:-false}"
       AUTH_LOGIN_MAX_ATTEMPTS: "${AUTH_LOGIN_MAX_ATTEMPTS:-5}"
       AUTH_LOGIN_WINDOW_SECONDS: "${AUTH_LOGIN_WINDOW_SECONDS:-60}"
       AUTH_LOGIN_BLOCK_SECONDS: "${AUTH_LOGIN_BLOCK_SECONDS:-300}"
       AUTH_TRUST_PROXY_HEADERS: "${AUTH_TRUST_PROXY_HEADERS:-false}"
+      SECURITY_STATE_BACKEND: "${SECURITY_STATE_BACKEND:-postgres}"
       DATABASE_ENABLED: "${DATABASE_ENABLED:-true}"
       POSTGRES_HOST: "postgres"
       POSTGRES_PORT: "5432"

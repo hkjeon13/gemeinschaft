@@ -1,12 +1,15 @@
 import json
 import os
+import logging
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
 
 from .api import router
 from .services.auth import validate_auth_settings
+from .services.authorization import validate_authorization_settings
 from .services.database import validate_database_settings
+from .services.security_state import initialize_security_state
 
 __version__ = os.environ.get("VERSION", "0.0.0")
 app = FastAPI(
@@ -20,8 +23,11 @@ app.include_router(router)
 
 @app.on_event("startup")
 async def startup_validate_auth_settings() -> None:
+    logging.getLogger("security.audit").setLevel(logging.INFO)
     validate_auth_settings()
+    validate_authorization_settings()
     validate_database_settings()
+    initialize_security_state()
 
 
 @app.get("/docs", include_in_schema=False)

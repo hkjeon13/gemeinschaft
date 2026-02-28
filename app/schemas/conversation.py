@@ -21,6 +21,7 @@ class ConversationSummarySchema(BaseModel):
 
 class ConversationDetailSchema(BaseModel):
     conversation_id: str
+    tenant_id: str
     user_id: str
     messages: List[MessageSchema]
     updated_at: str

@@ -11,11 +11,12 @@ def _now_iso() -> str:
 class ConversationStore:
     def __init__(self) -> None:
         self._lock = Lock()
-        self._conversations_by_user: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._conversations_by_tenant: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
 
-    def list_conversations(self, user_id: str) -> List[Dict[str, Any]]:
+    def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
         with self._lock:
-            user_conversations = self._conversations_by_user.get(user_id, {})
+            tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
+            user_conversations = tenant_conversations.get(user_id, {})
             summaries = []
             for conversation_id, conversation in user_conversations.items():
                 summaries.append(
@@ -29,20 +30,22 @@ class ConversationStore:
         summaries.sort(key=lambda item: item["updated_at"], reverse=True)
         return summaries
 
-    def get_conversation(self, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
-            user_conversations = self._conversations_by_user.get(user_id, {})
+            tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
+            user_conversations = tenant_conversations.get(user_id, {})
             conversation = user_conversations.get(conversation_id)
             if conversation is None:
                 return None
             return {
                 "conversation_id": conversation_id,
+                "tenant_id": tenant_id,
                 "user_id": user_id,
                 "messages": list(conversation["messages"]),
                 "updated_at": conversation["updated_at"],
             }
 
-    def append_message(self, user_id: str, conversation_id: str, message: str) -> Dict[str, Any]:
+    def append_message(self, tenant_id: str, user_id: str, conversation_id: str, message: str) -> Dict[str, Any]:
         now = _now_iso()
         entry = {
             "message_id": uuid.uuid4().hex,
@@ -51,7 +54,8 @@ class ConversationStore:
         }
 
         with self._lock:
-            user_conversations = self._conversations_by_user.setdefault(user_id, {})
+            tenant_conversations = self._conversations_by_tenant.setdefault(tenant_id, {})
+            user_conversations = tenant_conversations.setdefault(user_id, {})
             conversation = user_conversations.setdefault(
                 conversation_id,
                 {
@@ -64,6 +68,7 @@ class ConversationStore:
 
             return {
                 "conversation_id": conversation_id,
+                "tenant_id": tenant_id,
                 "user_id": user_id,
                 "messages": list(conversation["messages"]),
                 "updated_at": conversation["updated_at"],
