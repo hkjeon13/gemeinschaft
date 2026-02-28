@@ -7,19 +7,58 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas.conversation import (
     ConversationDetailSchema,
+    ConversationModelOptionSchema,
     ConversationSummarySchema,
     ConversationTitleSchema,
     ConversationTitleUpdateSchema,
     ConversationVisibilitySchema,
     MessageCreateSchema,
     MessageInputSchema,
+    UserDefaultModelSchema,
+    UserDefaultModelUpdateSchema,
 )
 from app.services.async_openai_chat_model import AsyncOpenAIChatModel
 from app.services.authorization import AccessContext, authorize_action, require_access_context
-from app.services.chat_model_registry import ResolvedChatModel, resolve_chat_model
+from app.services.chat_model_registry import (
+    ResolvedChatModel,
+    get_chat_model,
+    list_chat_models,
+    resolve_chat_model,
+)
 from app.services.conversation_store import conversation_store
+from app.services.user_model_preference_store import user_model_preference_store
 
 conversation_router = APIRouter()
+
+
+def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
+    return is_active and provider == "openai"
+
+
+def _effective_default_model(tenant_id: str, user_id: str) -> tuple[str, str, str]:
+    """Return (model_id, display_name, source)."""
+    preferred = user_model_preference_store.get_default_model_id(tenant_id=tenant_id, user_id=user_id)
+    if preferred:
+        preferred_record = get_chat_model(preferred)
+        if preferred_record is not None and _is_supported_conversation_model(
+            preferred_record.provider, preferred_record.is_active
+        ):
+            return preferred_record.model_id, preferred_record.display_name, "user"
+        user_model_preference_store.clear_default_model_id(tenant_id=tenant_id, user_id=user_id)
+
+    all_models = list_chat_models()
+    for model in all_models:
+        if model.is_default and _is_supported_conversation_model(model.provider, model.is_active):
+            return model.model_id, model.display_name, "global"
+
+    for model in all_models:
+        if _is_supported_conversation_model(model.provider, model.is_active):
+            return model.model_id, model.display_name, "global"
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="No active conversation model is configured.",
+    )
 
 
 def _chat_model(selected: ResolvedChatModel) -> AsyncOpenAIChatModel:
@@ -177,6 +216,89 @@ async def conversation_list(access: AccessContext = Depends(require_access_conte
     )
 
 
+@conversation_router.get("/model/list", response_model=List[ConversationModelOptionSchema])
+async def conversation_model_list(access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="conversation:model:list")
+    all_models = await run_in_threadpool(list_chat_models)
+    user_default_id = await run_in_threadpool(
+        user_model_preference_store.get_default_model_id,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+
+    items: List[ConversationModelOptionSchema] = []
+    for item in all_models:
+        if not _is_supported_conversation_model(item.provider, item.is_active):
+            continue
+        items.append(
+            ConversationModelOptionSchema(
+                model_id=item.model_id,
+                provider=item.provider,
+                openai_api=item.openai_api,
+                model=item.model,
+                display_name=item.display_name,
+                description=item.description,
+                is_global_default=item.is_default,
+                is_user_default=(item.model_id == user_default_id),
+            )
+        )
+    return items
+
+
+@conversation_router.get("/model/default", response_model=UserDefaultModelSchema)
+async def conversation_default_model(access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="conversation:model:get_default")
+    model_id, display_name, source = await run_in_threadpool(
+        _effective_default_model,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+    return UserDefaultModelSchema(model_id=model_id, display_name=display_name, source=source)
+
+
+@conversation_router.put("/model/default", response_model=UserDefaultModelSchema)
+async def set_conversation_default_model(
+    payload: UserDefaultModelUpdateSchema,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:model:set_default")
+    requested_model_id = payload.model_id.strip()
+    model = await run_in_threadpool(get_chat_model, requested_model_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Requested model is not registered.")
+    if not model.is_active:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requested model is inactive.")
+    if model.provider != "openai":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Requested model provider is not supported for conversations yet.",
+        )
+
+    await run_in_threadpool(
+        user_model_preference_store.set_default_model_id,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        model_id=model.model_id,
+    )
+    return UserDefaultModelSchema(model_id=model.model_id, display_name=model.display_name, source="user")
+
+
+@conversation_router.delete("/model/default", response_model=UserDefaultModelSchema)
+async def clear_conversation_default_model(access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="conversation:model:set_default")
+    await run_in_threadpool(
+        user_model_preference_store.clear_default_model_id,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+    model_id, display_name, source = await run_in_threadpool(
+        _effective_default_model,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+    return UserDefaultModelSchema(model_id=model_id, display_name=display_name, source=source)
+
+
 @conversation_router.get("/{conversation_id}", response_model=ConversationDetailSchema)
 async def get_dialogue(conversation_id: str, access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:get", resource_id=conversation_id)
@@ -208,7 +330,14 @@ async def create_dialogue(
         message=user_message,
         role="user",
     )
-    selected_model = await run_in_threadpool(resolve_chat_model, payload.model_id)
+    selected_model_id: str | None = payload.model_id
+    if selected_model_id is None:
+        selected_model_id, _, _ = await run_in_threadpool(
+            _effective_default_model,
+            tenant_id=access.tenant,
+            user_id=access.subject,
+        )
+    selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
     if selected_model.provider != "openai":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

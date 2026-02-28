@@ -32,6 +32,18 @@ def _default_policies() -> Dict[str, Dict[str, Any]]:
             "required_scopes": ["conversation:write"],
             "enforce_tenant": True,
         },
+        "conversation:model:list": {
+            "required_scopes": ["conversation:read"],
+            "enforce_tenant": True,
+        },
+        "conversation:model:get_default": {
+            "required_scopes": ["conversation:read"],
+            "enforce_tenant": True,
+        },
+        "conversation:model:set_default": {
+            "required_scopes": ["conversation:write"],
+            "enforce_tenant": True,
+        },
         "conversation:update": {
             "required_scopes": ["conversation:write"],
             "enforce_tenant": True,

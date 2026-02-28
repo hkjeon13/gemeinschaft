@@ -16,6 +16,7 @@ from .services.conversation_store import (
 )
 from .services.database import validate_database_settings
 from .services.security_state import initialize_security_state
+from .services.user_model_preference_store import initialize_user_model_preference_store
 
 __version__ = os.environ.get("VERSION", "0.0.0")
 app = FastAPI(
@@ -63,6 +64,7 @@ async def startup_validate_auth_settings() -> None:
     validate_authorization_settings()
     validate_database_settings()
     initialize_chat_model_registry()
+    initialize_user_model_preference_store()
     start_conversation_store_background_tasks()
     initialize_security_state()
 

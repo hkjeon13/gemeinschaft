@@ -67,3 +67,24 @@ class ConversationTitleUpdateSchema(BaseModel):
 class ConversationTitleSchema(BaseModel):
     conversation_id: str
     title: str
+
+
+class ConversationModelOptionSchema(BaseModel):
+    model_id: str
+    provider: str
+    openai_api: str
+    model: str
+    display_name: str
+    description: str
+    is_global_default: bool
+    is_user_default: bool
+
+
+class UserDefaultModelSchema(BaseModel):
+    model_id: str
+    display_name: str
+    source: Literal["user", "global"]
+
+
+class UserDefaultModelUpdateSchema(BaseModel):
+    model_id: str = Field(..., min_length=1)
