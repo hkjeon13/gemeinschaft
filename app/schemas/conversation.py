@@ -41,6 +41,7 @@ class MessageSchema(BaseModel):
 
 class ConversationSummarySchema(BaseModel):
     conversation_id: str
+    title: str
     message_count: int
     updated_at: str
 
@@ -54,5 +55,15 @@ class ConversationDetailSchema(BaseModel):
     conversation_id: str
     tenant_id: str
     user_id: str
+    title: str
     messages: List[MessageSchema]
     updated_at: str
+
+
+class ConversationTitleUpdateSchema(BaseModel):
+    title: str = Field(..., min_length=1, max_length=120)
+
+
+class ConversationTitleSchema(BaseModel):
+    conversation_id: str
+    title: str
