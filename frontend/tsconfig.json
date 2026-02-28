@@ -18,5 +18,6 @@
     "types": ["vite/client"]
   },
   "include": ["src"],
+  "exclude": ["src/app/components/ui/**/*"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

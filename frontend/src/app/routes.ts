@@ -1,4 +1,4 @@
-import { createBrowserRouter } from 'react-router';
+import { createBrowserRouter } from "react-router-dom";
 import { LoginPage } from './components/LoginPage';
 import { AdminPage } from './components/AdminPage';
 

@@ -8,7 +8,6 @@ const BASE_URL = 'https://dataset.fin-ally.net/api';
 const DEBUG = true;
 
 interface FetchOptions extends RequestInit {
-  skipAuth?: boolean;
   skipRefresh?: boolean;
 }
 
@@ -63,7 +62,7 @@ export async function apiRequest<T>(
   endpoint: string,
   options: FetchOptions = {}
 ): Promise<T> {
-  const { skipAuth, skipRefresh, ...fetchOptions } = options;
+  const { skipRefresh, ...fetchOptions } = options;
   const url = `${BASE_URL}${endpoint}`;
   const method = fetchOptions.method || 'GET';
 

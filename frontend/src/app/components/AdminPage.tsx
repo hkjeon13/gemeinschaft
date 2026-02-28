@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router';
+import { useNavigate } from "react-router-dom";
 import { getMe, getUsers, updateUserRole, logout } from '../utils/api';
 
 interface User {
