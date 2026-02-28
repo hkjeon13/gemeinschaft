@@ -89,6 +89,9 @@ def enforce_origin_for_state_change(request: Request) -> None:
     if not allowed:
         allowed = [_request_external_origin(request)]
 
+    if "*" in allowed:
+        return
+
     if origin not in allowed:
         emit_security_event(
             event_type="origin_denied",

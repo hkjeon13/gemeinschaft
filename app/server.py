@@ -2,6 +2,7 @@ import json
 import os
 import logging
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
 
@@ -18,6 +19,25 @@ app = FastAPI(
     docs_url=None,
     swagger_ui_parameters={"persistAuthorization": True},
 )
+
+
+def _parse_allowed_origins() -> list[str]:
+    raw = os.getenv("AUTH_ALLOWED_ORIGINS", "").strip()
+    if not raw:
+        return []
+    return [origin.strip().lower().rstrip("/") for origin in raw.split(",") if origin.strip()]
+
+
+cors_allowed_origins = _parse_allowed_origins()
+if cors_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
 app.include_router(router)
 
 
