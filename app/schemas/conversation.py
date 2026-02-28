@@ -1,14 +1,16 @@
-from typing import List
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
 class MessageCreateSchema(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
+    model_id: Optional[str] = Field(default=None, min_length=1)
 
 
 class MessageSchema(BaseModel):
     message_id: str
+    role: Literal["user", "assistant", "system"]
     message: str
     created_at: str
 

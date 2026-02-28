@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse
 from .api import router
 from .services.auth import validate_auth_settings
 from .services.authorization import validate_authorization_settings
+from .services.chat_model_registry import initialize_chat_model_registry
 from .services.database import validate_database_settings
 from .services.security_state import initialize_security_state
 
@@ -57,6 +58,7 @@ async def startup_validate_auth_settings() -> None:
     validate_auth_settings()
     validate_authorization_settings()
     validate_database_settings()
+    initialize_chat_model_registry()
     initialize_security_state()
 
 

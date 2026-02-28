@@ -2,7 +2,14 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.schemas.admin import AdminUserCreateSchema, AdminUserSchema, AdminUserUpdateSchema
+from app.schemas.admin import (
+    AdminChatModelCreateSchema,
+    AdminChatModelSchema,
+    AdminChatModelUpdateSchema,
+    AdminUserCreateSchema,
+    AdminUserSchema,
+    AdminUserUpdateSchema,
+)
 from app.services.authorization import AccessContext, authorize_action, require_access_context
 from app.services.auth import (
     create_auth_user,
@@ -11,8 +18,31 @@ from app.services.auth import (
     list_auth_users,
     update_auth_user,
 )
+from app.services.chat_model_registry import (
+    create_chat_model,
+    delete_chat_model,
+    list_chat_models,
+    update_chat_model,
+)
 
 admin_router = APIRouter()
+
+
+def _model_schema(item) -> AdminChatModelSchema:
+    return AdminChatModelSchema(
+        model_id=item.model_id,
+        provider=item.provider,
+        client_type=item.client_type,
+        model=item.model,
+        display_name=item.display_name,
+        description=item.description,
+        parameters=item.parameters,
+        has_api_key=item.has_api_key,
+        is_active=item.is_active,
+        is_default=item.is_default,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
+    )
 
 
 @admin_router.get("/users", response_model=List[AdminUserSchema])
@@ -86,3 +116,73 @@ async def admin_delete_user(username: str, access: AccessContext = Depends(requi
             detail="User not found.",
         )
     delete_auth_user(username)
+
+
+@admin_router.get("/models", response_model=List[AdminChatModelSchema])
+async def admin_list_models(access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="admin:model:list")
+    return [_model_schema(item) for item in list_chat_models()]
+
+
+@admin_router.post("/models", response_model=AdminChatModelSchema, status_code=status.HTTP_201_CREATED)
+async def admin_create_model(payload: AdminChatModelCreateSchema, access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="admin:model:create")
+    created = create_chat_model(
+        model_id=payload.model_id,
+        provider=payload.provider,
+        client_type=payload.client_type,
+        model=payload.model,
+        display_name=payload.display_name,
+        description=payload.description,
+        parameters=payload.parameters,
+        api_key=payload.api_key,
+        is_active=payload.is_active,
+        is_default=payload.is_default,
+    )
+    return _model_schema(created)
+
+
+@admin_router.patch("/models/{model_id}", response_model=AdminChatModelSchema)
+async def admin_update_model(
+    model_id: str,
+    payload: AdminChatModelUpdateSchema,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="admin:model:update")
+    if (
+        payload.provider is None
+        and payload.client_type is None
+        and payload.model is None
+        and payload.display_name is None
+        and payload.description is None
+        and payload.parameters is None
+        and payload.api_key is None
+        and payload.clear_api_key is None
+        and payload.is_active is None
+        and payload.is_default is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided.",
+        )
+
+    updated = update_chat_model(
+        model_id=model_id,
+        provider=payload.provider,
+        client_type=payload.client_type,
+        model=payload.model,
+        display_name=payload.display_name,
+        description=payload.description,
+        parameters=payload.parameters,
+        api_key=payload.api_key,
+        clear_api_key=payload.clear_api_key,
+        is_active=payload.is_active,
+        is_default=payload.is_default,
+    )
+    return _model_schema(updated)
+
+
+@admin_router.delete("/models/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def admin_delete_model(model_id: str, access: AccessContext = Depends(require_access_context)):
+    authorize_action(access, action="admin:model:delete")
+    delete_chat_model(model_id)

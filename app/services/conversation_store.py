@@ -3,9 +3,31 @@ from threading import Lock
 from typing import Any, Dict, List, Optional
 import uuid
 
+_ALLOWED_ROLES = {"user", "assistant", "system"}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_role(role: str) -> str:
+    normalized = role.strip().lower()
+    if normalized in _ALLOWED_ROLES:
+        return normalized
+    return "user"
+
+
+def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
+    message_id = entry.get("message_id")
+    created_at = entry.get("created_at")
+    message = entry.get("message")
+    role = entry.get("role", "user")
+    return {
+        "message_id": str(message_id or ""),
+        "role": _normalize_role(str(role)),
+        "message": str(message or ""),
+        "created_at": str(created_at or _now_iso()),
+    }
 
 
 class ConversationStore:
@@ -41,17 +63,27 @@ class ConversationStore:
                 "conversation_id": conversation_id,
                 "tenant_id": tenant_id,
                 "user_id": user_id,
-                "messages": list(conversation["messages"]),
+                "messages": [_normalized_message(item) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
 
-    def append_message(self, tenant_id: str, user_id: str, conversation_id: str, message: str) -> Dict[str, Any]:
+    def append_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        role: str = "user",
+    ) -> Dict[str, Any]:
         now = _now_iso()
-        entry = {
-            "message_id": uuid.uuid4().hex,
-            "message": message,
-            "created_at": now,
-        }
+        entry = _normalized_message(
+            {
+                "message_id": uuid.uuid4().hex,
+                "role": role,
+                "message": message,
+                "created_at": now,
+            }
+        )
 
         with self._lock:
             tenant_conversations = self._conversations_by_tenant.setdefault(tenant_id, {})
@@ -70,7 +102,7 @@ class ConversationStore:
                 "conversation_id": conversation_id,
                 "tenant_id": tenant_id,
                 "user_id": user_id,
-                "messages": list(conversation["messages"]),
+                "messages": [_normalized_message(item) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
 

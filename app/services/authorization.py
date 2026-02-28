@@ -52,6 +52,26 @@ def _default_policies() -> Dict[str, Dict[str, Any]]:
             "required_roles": ["admin"],
             "enforce_tenant": True,
         },
+        "admin:model:list": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
+        "admin:model:create": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
+        "admin:model:update": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
+        "admin:model:delete": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
     }
 
 
