@@ -1,7 +1,6 @@
 import base64
 import json
 import os
-import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,6 +14,7 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import ExpiredSignatureError, InvalidTokenError
 
+from .auth_user_store import StoredAuthUser, get_auth_user_store, initialize_auth_user_store
 from .security_audit import emit_security_event
 from .security_state import (
     get_security_state_backend,
@@ -504,23 +504,36 @@ def hash_password(plain_password: str) -> str:
     return bcrypt.hashpw(plain_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
 
 
-def verify_password(plain_password: str, record: AuthUserRecord) -> bool:
-    if record.password_hash is not None:
-        return bcrypt.checkpw(plain_password.encode("utf-8"), record.password_hash.encode("utf-8"))
+def _seed_users_for_store(seed_config: Dict[str, AuthUserRecord]) -> Dict[str, StoredAuthUser]:
+    seeded: Dict[str, StoredAuthUser] = {}
+    for username, config in seed_config.items():
+        password_hash = config.password_hash
+        if password_hash is None and config.plain_password is not None:
+            password_hash = hash_password(config.plain_password)
 
-    if record.plain_password is not None:
-        return secrets.compare_digest(record.plain_password, plain_password)
+        if password_hash is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"AUTH user '{username}' must define password_hash or password.",
+            )
 
-    return False
+        seeded[username] = StoredAuthUser(
+            username=username,
+            password_hash=password_hash,
+            role=config.role,
+            tenant=config.tenant,
+            scopes=list(config.scopes),
+        )
+    return seeded
 
 
 def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
-    users = _load_auth_users()
-    user = users.get(username)
+    user = get_auth_user_store().get_user(username)
     if not user:
         return None
 
-    if not verify_password(password, user):
+    _validate_bcrypt_hash_or_raise(username, user.password_hash)
+    if not bcrypt.checkpw(password.encode("utf-8"), user.password_hash.encode("utf-8")):
         return None
 
     return AuthUser(
@@ -528,6 +541,179 @@ def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
         role=user.role,
         tenant=user.tenant,
         scopes=user.scopes,
+    )
+
+
+def _normalize_username_or_raise(username: str) -> str:
+    normalized = username.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="username is required.",
+        )
+    return normalized
+
+
+def _normalize_role_or_raise(role: str) -> str:
+    normalized = role.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="role is required.",
+        )
+    return normalized
+
+
+def _normalize_tenant_or_raise(tenant: str) -> str:
+    normalized = tenant.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tenant is required.",
+        )
+    return normalized
+
+
+def _normalize_password_or_raise(password: str) -> str:
+    value = password.strip()
+    if len(value) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="password must be at least 8 characters.",
+        )
+    return value
+
+
+def list_auth_users() -> List[AuthUser]:
+    users = get_auth_user_store().list_users()
+    return [
+        AuthUser(
+            username=user.username,
+            role=user.role,
+            tenant=user.tenant,
+            scopes=list(user.scopes),
+        )
+        for user in users
+    ]
+
+
+def get_auth_user(username: str) -> Optional[AuthUser]:
+    user = get_auth_user_store().get_user(_normalize_username_or_raise(username))
+    if user is None:
+        return None
+
+    return AuthUser(
+        username=user.username,
+        role=user.role,
+        tenant=user.tenant,
+        scopes=list(user.scopes),
+    )
+
+
+def _count_admin_users() -> int:
+    return len([user for user in get_auth_user_store().list_users() if user.role == "admin"])
+
+
+def create_auth_user(username: str, password: str, role: str, tenant: str, scopes: List[str]) -> AuthUser:
+    normalized_username = _normalize_username_or_raise(username)
+    if get_auth_user_store().get_user(normalized_username) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User already exists.",
+        )
+
+    stored = StoredAuthUser(
+        username=normalized_username,
+        password_hash=hash_password(_normalize_password_or_raise(password)),
+        role=_normalize_role_or_raise(role),
+        tenant=_normalize_tenant_or_raise(tenant),
+        scopes=_normalize_scope_values(scopes),
+    )
+    get_auth_user_store().upsert_user(stored)
+
+    emit_security_event(
+        event_type="admin_user_created",
+        outcome="allow",
+        target_user=stored.username,
+        role=stored.role,
+        tenant=stored.tenant,
+        scope=stored.scopes,
+    )
+    return AuthUser(
+        username=stored.username,
+        role=stored.role,
+        tenant=stored.tenant,
+        scopes=stored.scopes,
+    )
+
+
+def update_auth_user(
+    username: str,
+    password: Optional[str] = None,
+    role: Optional[str] = None,
+    tenant: Optional[str] = None,
+    scopes: Optional[List[str]] = None,
+) -> AuthUser:
+    normalized_username = _normalize_username_or_raise(username)
+    existing = get_auth_user_store().get_user(normalized_username)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found.",
+        )
+
+    new_role = existing.role if role is None else _normalize_role_or_raise(role)
+    if existing.role == "admin" and new_role != "admin" and _count_admin_users() <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot remove the last admin user.",
+        )
+
+    updated = StoredAuthUser(
+        username=existing.username,
+        password_hash=existing.password_hash if password is None else hash_password(_normalize_password_or_raise(password)),
+        role=new_role,
+        tenant=existing.tenant if tenant is None else _normalize_tenant_or_raise(tenant),
+        scopes=existing.scopes if scopes is None else _normalize_scope_values(scopes),
+    )
+
+    get_auth_user_store().upsert_user(updated)
+    emit_security_event(
+        event_type="admin_user_updated",
+        outcome="allow",
+        target_user=updated.username,
+        role=updated.role,
+        tenant=updated.tenant,
+        scope=updated.scopes,
+    )
+    return AuthUser(
+        username=updated.username,
+        role=updated.role,
+        tenant=updated.tenant,
+        scopes=updated.scopes,
+    )
+
+
+def delete_auth_user(username: str) -> None:
+    normalized_username = _normalize_username_or_raise(username)
+    existing = get_auth_user_store().get_user(normalized_username)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found.",
+        )
+
+    if existing.role == "admin" and _count_admin_users() <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete the last admin user.",
+        )
+
+    get_auth_user_store().delete_user(normalized_username)
+    emit_security_event(
+        event_type="admin_user_deleted",
+        outcome="allow",
+        target_user=normalized_username,
     )
 
 
@@ -870,11 +1056,13 @@ def validate_auth_settings() -> None:
     _access_token_expires_minutes()
     _refresh_token_expires_days()
 
-    users = _load_auth_users()
-    if not users:
+    seed_users = _load_auth_users()
+    initialize_auth_user_store(_seed_users_for_store(seed_users))
+
+    if get_auth_user_store().count_users() <= 0:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="AUTH users must include at least one user.",
+            detail="At least one AUTH user must exist in the user store.",
         )
 
     login_rate_limit_settings()

@@ -40,6 +40,7 @@ services:
       JWT_ACTIVE_KID: "${JWT_ACTIVE_KID:-}"
       AUTH_USERS_FILE: "${AUTH_USERS_FILE:-/run/secrets/auth_users.json}"
       AUTH_USERS_JSON: "${AUTH_USERS_JSON:-}"
+      AUTH_USER_STORE_BACKEND: "${AUTH_USER_STORE_BACKEND:-}"
       AUTH_DEFAULT_TENANT: "${AUTH_DEFAULT_TENANT:-default}"
       AUTH_DEFAULT_SCOPES: "${AUTH_DEFAULT_SCOPES:-conversation:read conversation:write}"
       AUTH_ALLOW_PLAINTEXT_PASSWORDS: "${AUTH_ALLOW_PLAINTEXT_PASSWORDS:-false}"

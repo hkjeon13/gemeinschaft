@@ -26,15 +26,15 @@ python app/scripts/generate_rsa_jwt_keys.py \
 # 2) bcrypt hash (copy output)
 python - <<'PY'
 import bcrypt
-print(bcrypt.hashpw(b'alice-pass', bcrypt.gensalt()).decode())
+print(bcrypt.hashpw(b'psyche-pass', bcrypt.gensalt()).decode())
 PY
 
 # 3) auth user file (paste real hash from step 2)
 cat > secrets/auth_users.json <<'JSON'
 {
-  "alice": {
+  "psyche": {
     "password_hash": "$2b$12$REPLACE_WITH_REAL_BCRYPT_HASH",
-    "role": "member",
+    "role": "admin",
     "tenant": "default",
     "scopes": ["conversation:read", "conversation:write"]
   }
@@ -58,7 +58,7 @@ Then verify:
 curl -s http://localhost:10015/api/auth/.well-known/jwks.json
 curl -s -X POST http://localhost:10015/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"alice-pass"}'
+  -d '{"username":"psyche","password":"psyche-pass"}'
 ```
 
 ## 1) Prerequisites
@@ -110,16 +110,16 @@ This creates JSON like:
 Generate bcrypt hash example:
 
 ```bash
-python -c "import bcrypt; print(bcrypt.hashpw(b'alice-pass', bcrypt.gensalt()).decode())"
+python -c "import bcrypt; print(bcrypt.hashpw(b'psyche-pass', bcrypt.gensalt()).decode())"
 ```
 
 Create `secrets/auth_users.json`:
 
 ```json
 {
-  "alice": {
+  "psyche": {
     "password_hash": "$2b$12$replace_with_real_hash",
-    "role": "member",
+    "role": "admin",
     "tenant": "default",
     "scopes": ["conversation:read", "conversation:write"]
   }
@@ -159,7 +159,7 @@ curl -s http://localhost:10015/api/auth/.well-known/jwks.json
 ```bash
 curl -s -X POST http://localhost:10015/api/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"alice-pass"}'
+  -d '{"username":"psyche","password":"psyche-pass"}'
 ```
 
 Use returned `access_token`:
@@ -175,6 +175,17 @@ Conversation endpoints require valid JWT and correct scope:
 - `GET /api/conversation/` -> needs `conversation:read`
 - `GET /api/conversation/{id}` -> needs `conversation:read`
 - `POST /api/conversation/{id}` -> needs `conversation:write`
+
+### 6.4 Admin check (role enforced)
+
+Admin user management endpoints require `role=admin`:
+- `GET /api/admin/users`
+- `POST /api/admin/users`
+- `PATCH /api/admin/users/{username}`
+- `DELETE /api/admin/users/{username}`
+
+Admin UI is available at:
+- `https://dataset.fin-ally.net/admin`
 
 ## 7) Edge Nginx integration (`dataset.fin-ally.net`)
 
@@ -253,7 +264,7 @@ If you see:
 It is a Docker Compose v2 warning only. Deployment still works.  
 You can remove top-level `version: "3.9"` from `docker-compose.yml` to silence it.
 
-### 12.2 `AUTH user 'alice' has invalid bcrypt hash`
+### 12.2 `AUTH user 'psyche' has invalid bcrypt hash`
 
 Cause:
 - `secrets/auth_users.json` contains a non-bcrypt value (example placeholder or broken string).

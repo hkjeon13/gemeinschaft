@@ -32,6 +32,26 @@ def _default_policies() -> Dict[str, Dict[str, Any]]:
             "required_scopes": ["conversation:write"],
             "enforce_tenant": True,
         },
+        "admin:user:list": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
+        "admin:user:create": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
+        "admin:user:update": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
+        "admin:user:delete": {
+            "required_scopes": [],
+            "required_roles": ["admin"],
+            "enforce_tenant": True,
+        },
     }
 
 
@@ -86,6 +106,25 @@ def _load_authz_policies() -> Dict[str, Dict[str, Any]]:
                 )
             normalized_scopes.append(scope)
 
+        required_roles = policy.get("required_roles", [])
+        if isinstance(required_roles, str):
+            required_roles = [role for role in required_roles.split(" ") if role]
+
+        if not isinstance(required_roles, list):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"AUTHZ policy '{action}' required_roles must be a list or space-delimited string.",
+            )
+
+        normalized_roles: List[str] = []
+        for role in required_roles:
+            if not isinstance(role, str) or not role:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"AUTHZ policy '{action}' required_roles values must be non-empty strings.",
+                )
+            normalized_roles.append(role)
+
         enforce_tenant = bool(policy.get("enforce_tenant", True))
 
         resource_prefix = policy.get("resource_prefix")
@@ -97,6 +136,7 @@ def _load_authz_policies() -> Dict[str, Dict[str, Any]]:
 
         policies[action] = {
             "required_scopes": normalized_scopes,
+            "required_roles": normalized_roles,
             "enforce_tenant": enforce_tenant,
             "resource_prefix": resource_prefix,
         }
@@ -155,6 +195,25 @@ def authorize_action(access: AccessContext, action: str, resource_id: Optional[s
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Insufficient scope.",
         )
+
+    required_roles = policy.get("required_roles", [])
+    if required_roles:
+        current_role = access.role or ""
+        if current_role not in required_roles:
+            emit_security_event(
+                event_type="authorization_denied",
+                outcome="deny",
+                action=action,
+                reason="missing_role",
+                subject=access.subject,
+                tenant=access.tenant,
+                required_roles=required_roles,
+                current_role=current_role,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient role.",
+            )
 
     if policy["enforce_tenant"] and not access.tenant:
         emit_security_event(
