@@ -1,9 +1,13 @@
-import os
 import json
+import os
 from fastapi import FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import HTMLResponse
+
 from .api import router
+from .services.auth import validate_auth_settings
+from .services.database import validate_database_settings
+
 __version__ = os.environ.get("VERSION", "0.0.0")
 app = FastAPI(
     title=os.getenv("ENV_APP_NAME", "AI Society"),
@@ -12,6 +16,12 @@ app = FastAPI(
     swagger_ui_parameters={"persistAuthorization": True},
 )
 app.include_router(router)
+
+
+@app.on_event("startup")
+async def startup_validate_auth_settings() -> None:
+    validate_auth_settings()
+    validate_database_settings()
 
 
 @app.get("/docs", include_in_schema=False)
@@ -37,6 +47,3 @@ window.addEventListener("load", function() {{
 """
     patched = html.body.decode("utf-8").replace("</body>", script + "</body>")
     return HTMLResponse(content=patched, status_code=html.status_code)
-
-
-

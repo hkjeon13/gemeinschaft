@@ -1,2 +1,4 @@
 fastapi[standard]
 gunicorn
+PyJWT>=2.4,<3
+bcrypt>=3.2,<5
