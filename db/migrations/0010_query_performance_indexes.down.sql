@@ -1,5 +1,0 @@
-DROP INDEX IF EXISTS idx_automation_run_template_scheduled_desc;
-DROP INDEX IF EXISTS idx_automation_template_scope_updated;
-DROP INDEX IF EXISTS idx_participant_conversation_active_joined;
-DROP INDEX IF EXISTS idx_message_conversation_turn_desc;
-DROP INDEX IF EXISTS idx_message_conversation_status_turn;
