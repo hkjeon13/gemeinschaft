@@ -9,5 +9,5 @@ echo "🚀 Starting FastAPI app for the Custom Chatbot service..."
 exec gunicorn app.server:app \
   -k uvicorn.workers.UvicornWorker \
   --bind "${APP_HOST:-0.0.0.0}:${APP_PORT:-8000}" \
-  --workers "${APP_WORKERS:-2}" \
+  --workers "${APP_WORKERS:-1}" \
   --timeout "${GUNICORN_TIMEOUT:-500}"

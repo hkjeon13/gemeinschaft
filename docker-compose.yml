@@ -1,6 +1,41 @@
 version: "3.9"
 
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gemeinschaft-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_WORKERS: "${APP_WORKERS:-1}"
+      GUNICORN_TIMEOUT: "${GUNICORN_TIMEOUT:-500}"
+      JWT_SECRET_KEY: "${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set}"
+      JWT_ALGORITHM: "${JWT_ALGORITHM:-HS256}"
+      JWT_ISSUER: "${JWT_ISSUER:-gemeinschaft-api}"
+      JWT_AUDIENCE: "${JWT_AUDIENCE:-gemeinschaft-clients}"
+      JWT_ACCESS_TOKEN_EXPIRES_MINUTES: "${JWT_ACCESS_TOKEN_EXPIRES_MINUTES:-60}"
+      JWT_REFRESH_TOKEN_EXPIRES_DAYS: "${JWT_REFRESH_TOKEN_EXPIRES_DAYS:-14}"
+      AUTH_USERS_JSON: "${AUTH_USERS_JSON:?AUTH_USERS_JSON must be set}"
+      AUTH_ALLOW_PLAINTEXT_PASSWORDS: "${AUTH_ALLOW_PLAINTEXT_PASSWORDS:-false}"
+      AUTH_LOGIN_MAX_ATTEMPTS: "${AUTH_LOGIN_MAX_ATTEMPTS:-5}"
+      AUTH_LOGIN_WINDOW_SECONDS: "${AUTH_LOGIN_WINDOW_SECONDS:-60}"
+      AUTH_LOGIN_BLOCK_SECONDS: "${AUTH_LOGIN_BLOCK_SECONDS:-300}"
+      AUTH_TRUST_PROXY_HEADERS: "${AUTH_TRUST_PROXY_HEADERS:-false}"
+      DATABASE_ENABLED: "${DATABASE_ENABLED:-true}"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: "${POSTGRES_DB:-gemeinschaft}"
+      POSTGRES_USER: "${POSTGRES_USER:-gemeinschaft}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change-me}"
+
   postgres:
     image: postgres:16-alpine
     container_name: gemeinschaft-postgres
