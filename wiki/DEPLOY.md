@@ -1,6 +1,7 @@
 # Deployment Guide (Docker Compose)
 
 This document describes production-style deployment for this project with:
+- `frontend` (static UI + `/api` reverse proxy, port `10015`)
 - `app` (FastAPI)
 - `postgres` (separate Docker service)
 - RS256 JWT keys and auth user data mounted from `./secrets`
@@ -54,8 +55,8 @@ docker compose ps
 Then verify:
 
 ```bash
-curl -s http://localhost:8000/auth/.well-known/jwks.json
-curl -s -X POST http://localhost:8000/auth/login \
+curl -s http://localhost:10015/api/auth/.well-known/jwks.json
+curl -s -X POST http://localhost:10015/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"alice","password":"alice-pass"}'
 ```
@@ -64,6 +65,7 @@ curl -s -X POST http://localhost:8000/auth/login \
 
 - Docker Engine + Docker Compose v2
 - Ports available:
+  - `10015` for frontend (or your custom `FRONTEND_PORT`)
   - `8000` for app (or your custom `APP_PORT`)
   - `5432` for postgres (or your custom `POSTGRES_PORT`)
 - Local files:
@@ -149,13 +151,13 @@ docker compose ps
 ### 6.1 Health/basic API checks
 
 ```bash
-curl -s http://localhost:8000/auth/.well-known/jwks.json
+curl -s http://localhost:10015/api/auth/.well-known/jwks.json
 ```
 
 ### 6.2 Login and JWT check
 
 ```bash
-curl -s -X POST http://localhost:8000/auth/login \
+curl -s -X POST http://localhost:10015/api/auth/login \
   -H "Content-Type: application/json" \
   -d '{"username":"alice","password":"alice-pass"}'
 ```
@@ -163,18 +165,40 @@ curl -s -X POST http://localhost:8000/auth/login \
 Use returned `access_token`:
 
 ```bash
-curl -s http://localhost:8000/auth/me \
+curl -s http://localhost:10015/api/auth/me \
   -H "Authorization: Bearer <ACCESS_TOKEN>"
 ```
 
 ### 6.3 Authorization check (scope enforced)
 
 Conversation endpoints require valid JWT and correct scope:
-- `GET /conversation/` -> needs `conversation:read`
-- `GET /conversation/{id}` -> needs `conversation:read`
-- `POST /conversation/{id}` -> needs `conversation:write`
+- `GET /api/conversation/` -> needs `conversation:read`
+- `GET /api/conversation/{id}` -> needs `conversation:read`
+- `POST /api/conversation/{id}` -> needs `conversation:write`
 
-## 7) Logs and audit events
+## 7) Edge Nginx integration (`dataset.fin-ally.net`)
+
+Your edge Nginx can keep routing all traffic to `127.0.0.1:10015`:
+- `/` serves frontend
+- `/api/*` is forwarded by frontend container to the `app` service
+
+Example edge snippet:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:10015/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_redirect off;
+}
+```
+
+## 8) Logs and audit events
 
 Follow logs:
 
@@ -190,7 +214,7 @@ Security events are written to logger `security.audit` as JSON, including:
 
 Forward these logs to your central logging/SIEM in production.
 
-## 8) Rolling update
+## 9) Rolling update
 
 When app code or env changes:
 
@@ -198,7 +222,7 @@ When app code or env changes:
 docker compose up -d --build
 ```
 
-## 9) JWT key rotation (no downtime pattern)
+## 10) JWT key rotation (no downtime pattern)
 
 1. Generate new key pair with new `kid`.
 2. Add new key to both key JSON files, keep old key too.
@@ -207,7 +231,7 @@ docker compose up -d --build
 5. Keep old key for at least `JWT_REFRESH_TOKEN_EXPIRES_DAYS`.
 6. Remove old key and redeploy again.
 
-## 10) Rollback
+## 11) Rollback
 
 If deploy fails after key switch:
 1. Restore previous `.env` and key files (including previous `JWT_ACTIVE_KID`).
@@ -219,9 +243,9 @@ docker compose up -d --build
 
 3. Verify `/auth/me` and `/conversation/*` authorization paths.
 
-## 11) Troubleshooting
+## 12) Troubleshooting
 
-### 11.1 `version is obsolete` warning
+### 12.1 `version is obsolete` warning
 
 If you see:
 - `the attribute version is obsolete`
@@ -229,7 +253,7 @@ If you see:
 It is a Docker Compose v2 warning only. Deployment still works.  
 You can remove top-level `version: "3.9"` from `docker-compose.yml` to silence it.
 
-### 11.2 `AUTH user 'alice' has invalid bcrypt hash`
+### 12.2 `AUTH user 'alice' has invalid bcrypt hash`
 
 Cause:
 - `secrets/auth_users.json` contains a non-bcrypt value (example placeholder or broken string).
@@ -244,7 +268,7 @@ docker compose up -d --build app
 docker compose logs -f app
 ```
 
-### 11.3 JWT key parse/validation errors
+### 12.3 JWT key parse/validation errors
 
 Cause:
 - `secrets/jwt_private_keys.json` or `secrets/jwt_public_keys.json` still contains template `...` values.

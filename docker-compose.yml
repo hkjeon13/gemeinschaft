@@ -1,4 +1,15 @@
 services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gemeinschaft-frontend
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "${FRONTEND_PORT:-10015}:80"
+
   app:
     build:
       context: .
@@ -11,7 +22,7 @@ services:
     volumes:
       - ./secrets:/run/secrets:ro
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
