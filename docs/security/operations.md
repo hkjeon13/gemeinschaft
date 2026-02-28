@@ -26,6 +26,24 @@ Key events:
 
 Forward these logs to your central logging/SIEM pipeline.
 
+## 3.1) Cookie session transport (recommended)
+- Access/refresh tokens are set as HttpOnly cookies by `/auth/login` and `/auth/refresh`.
+- Recommended defaults:
+  - `AUTH_COOKIE_SECURE=true`
+  - `AUTH_COOKIE_SAMESITE=lax` (or `strict` for tighter isolation)
+  - `AUTH_ACCESS_COOKIE_NAME=access_token`
+  - `AUTH_REFRESH_COOKIE_NAME=refresh_token`
+
+## 3.2) CSRF + DPoP hardening
+- CSRF:
+  - `AUTH_REQUIRE_CSRF=true`
+  - Send `X-CSRF-Token` header equal to `csrf_token` cookie for state-changing requests.
+  - Validate request `Origin` against `AUTH_ALLOWED_ORIGINS` (or same-host fallback).
+- DPoP:
+  - `AUTH_REQUIRE_DPOP=true`
+  - Require `DPoP` proof JWT (`ES256`) on login, refresh, logout, and protected API calls.
+  - Access/refresh tokens are sender-constrained with `cnf.jkt`.
+
 ## 4) Scope/Tenant/Resource policy
 - JWT claim `tenant` is required.
 - JWT claim `scope` is enforced (space-delimited scopes).

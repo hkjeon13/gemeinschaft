@@ -10,11 +10,19 @@ import bcrypt
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import ExpiredSignatureError, InvalidTokenError
 
 from .auth_user_store import StoredAuthUser, get_auth_user_store, initialize_auth_user_store
+from .request_security import (
+    auth_require_dpop,
+    csrf_cookie_name,
+    enforce_csrf_for_state_change,
+    enforce_origin_for_state_change,
+    new_csrf_token,
+    validate_dpop_proof,
+)
 from .security_audit import emit_security_event
 from .security_state import (
     get_security_state_backend,
@@ -291,7 +299,7 @@ def get_jwks_document() -> Dict[str, Any]:
 
 
 def _access_token_expires_minutes() -> int:
-    raw = os.getenv("JWT_ACCESS_TOKEN_EXPIRES_MINUTES", "60")
+    raw = os.getenv("JWT_ACCESS_TOKEN_EXPIRES_MINUTES", "15")
     try:
         value = int(raw)
     except ValueError:
@@ -391,6 +399,53 @@ def _allow_plaintext_passwords() -> bool:
 def _trust_proxy_headers() -> bool:
     raw = os.getenv("AUTH_TRUST_PROXY_HEADERS", "false").strip().lower()
     return raw in ("1", "true", "yes", "y")
+
+
+def _cookie_secure() -> bool:
+    raw = os.getenv("AUTH_COOKIE_SECURE", "true").strip().lower()
+    return raw in ("1", "true", "yes", "y")
+
+
+def _cookie_samesite() -> str:
+    value = os.getenv("AUTH_COOKIE_SAMESITE", "lax").strip().lower()
+    if value not in ("lax", "strict", "none"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_COOKIE_SAMESITE must be one of: lax, strict, none.",
+        )
+    if value == "none" and not _cookie_secure():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_COOKIE_SAMESITE=none requires AUTH_COOKIE_SECURE=true.",
+        )
+    return value
+
+
+def _cookie_domain() -> Optional[str]:
+    raw = os.getenv("AUTH_COOKIE_DOMAIN", "").strip()
+    if not raw:
+        return None
+    return raw
+
+
+def access_cookie_name() -> str:
+    name = os.getenv("AUTH_ACCESS_COOKIE_NAME", "access_token").strip()
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_ACCESS_COOKIE_NAME must be a non-empty string.",
+        )
+    return name
+
+
+def refresh_cookie_name() -> str:
+    name = os.getenv("AUTH_REFRESH_COOKIE_NAME", "refresh_token").strip()
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_REFRESH_COOKIE_NAME must be a non-empty string.",
+        )
+    return name
 
 
 def _validate_bcrypt_hash_or_raise(username: str, password_hash: str) -> None:
@@ -741,6 +796,7 @@ def _create_token_payload(
     scopes: List[str],
     token_type: str,
     expires_delta: timedelta,
+    dpop_jkt: Optional[str] = None,
 ) -> Dict[str, Any]:
     now = datetime.now(timezone.utc)
     expires_at = now + expires_delta
@@ -758,6 +814,8 @@ def _create_token_payload(
     }
     if role:
         payload["role"] = role
+    if dpop_jkt:
+        payload["cnf"] = {"jkt": dpop_jkt}
     return payload
 
 
@@ -772,7 +830,13 @@ def _encode_token(payload: Dict[str, Any]) -> str:
     )
 
 
-def _create_access_token_with_claims(subject: str, role: Optional[str], tenant: str, scopes: List[str]) -> Dict[str, Any]:
+def _create_access_token_with_claims(
+    subject: str,
+    role: Optional[str],
+    tenant: str,
+    scopes: List[str],
+    dpop_jkt: Optional[str] = None,
+) -> Dict[str, Any]:
     payload = _create_token_payload(
         subject=subject,
         role=role,
@@ -780,11 +844,18 @@ def _create_access_token_with_claims(subject: str, role: Optional[str], tenant: 
         scopes=scopes,
         token_type="access",
         expires_delta=timedelta(minutes=_access_token_expires_minutes()),
+        dpop_jkt=dpop_jkt,
     )
     return {"token": _encode_token(payload), "claims": payload}
 
 
-def _create_refresh_token_with_claims(subject: str, role: Optional[str], tenant: str, scopes: List[str]) -> Dict[str, Any]:
+def _create_refresh_token_with_claims(
+    subject: str,
+    role: Optional[str],
+    tenant: str,
+    scopes: List[str],
+    dpop_jkt: Optional[str] = None,
+) -> Dict[str, Any]:
     payload = _create_token_payload(
         subject=subject,
         role=role,
@@ -792,18 +863,37 @@ def _create_refresh_token_with_claims(subject: str, role: Optional[str], tenant:
         scopes=scopes,
         token_type="refresh",
         expires_delta=timedelta(days=_refresh_token_expires_days()),
+        dpop_jkt=dpop_jkt,
     )
     return {"token": _encode_token(payload), "claims": payload}
 
 
-def create_token_pair(subject: str, role: Optional[str], tenant: str, scopes: List[str]) -> Dict[str, Any]:
+def create_token_pair(
+    subject: str,
+    role: Optional[str],
+    tenant: str,
+    scopes: List[str],
+    dpop_jkt: Optional[str] = None,
+) -> Dict[str, Any]:
     if not tenant:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="tenant is required")
 
     normalized_scopes = _normalize_scope_values(scopes)
 
-    access = _create_access_token_with_claims(subject=subject, role=role, tenant=tenant, scopes=normalized_scopes)
-    refresh = _create_refresh_token_with_claims(subject=subject, role=role, tenant=tenant, scopes=normalized_scopes)
+    access = _create_access_token_with_claims(
+        subject=subject,
+        role=role,
+        tenant=tenant,
+        scopes=normalized_scopes,
+        dpop_jkt=dpop_jkt,
+    )
+    refresh = _create_refresh_token_with_claims(
+        subject=subject,
+        role=role,
+        tenant=tenant,
+        scopes=normalized_scopes,
+        dpop_jkt=dpop_jkt,
+    )
 
     refresh_jti = refresh["claims"]["jti"]
     refresh_exp = refresh["claims"]["exp"]
@@ -826,6 +916,65 @@ def create_token_pair(subject: str, role: Optional[str], tenant: str, scopes: Li
         "access_expires_in": access_token_expires_seconds(),
         "refresh_expires_in": refresh_token_expires_seconds(),
     }
+
+
+def _cookie_params() -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "httponly": True,
+        "secure": _cookie_secure(),
+        "samesite": _cookie_samesite(),
+        "path": "/",
+    }
+    domain = _cookie_domain()
+    if domain:
+        params["domain"] = domain
+    return params
+
+
+def attach_auth_cookies(response: Response, token_pair: Dict[str, Any]) -> None:
+    params = _cookie_params()
+    response.set_cookie(
+        key=access_cookie_name(),
+        value=token_pair["access_token"],
+        max_age=token_pair["access_expires_in"],
+        **params,
+    )
+    response.set_cookie(
+        key=refresh_cookie_name(),
+        value=token_pair["refresh_token"],
+        max_age=token_pair["refresh_expires_in"],
+        **params,
+    )
+    response.set_cookie(
+        key=csrf_cookie_name(),
+        value=new_csrf_token(),
+        max_age=token_pair["refresh_expires_in"],
+        httponly=False,
+        secure=params["secure"],
+        samesite=params["samesite"],
+        path="/",
+        domain=params.get("domain"),
+    )
+
+
+def clear_auth_cookies(response: Response) -> None:
+    domain = _cookie_domain()
+    response.delete_cookie(key=access_cookie_name(), path="/", domain=domain)
+    response.delete_cookie(key=refresh_cookie_name(), path="/", domain=domain)
+    response.delete_cookie(key=csrf_cookie_name(), path="/", domain=domain)
+
+
+def dpop_jkt_from_claims(claims: Dict[str, Any]) -> Optional[str]:
+    cnf = claims.get("cnf")
+    if cnf is None:
+        return None
+    if not isinstance(cnf, dict):
+        _raise_unauthorized("Invalid JWT cnf.")
+
+    jkt = cnf.get("jkt")
+    if not isinstance(jkt, str) or not jkt:
+        _raise_unauthorized("Invalid JWT cnf.jkt.")
+    return jkt
 
 
 def _select_signing_key_for_token(token: str, keyset: JwtKeyset) -> str:
@@ -916,6 +1065,7 @@ def decode_and_validate_jwt(token: str, expected_token_type: Optional[str] = "ac
         _raise_unauthorized("Invalid JWT tenant.")
 
     scopes_from_claims(claims)
+    dpop_jkt_from_claims(claims)
 
     if expected_token_type and token_type != expected_token_type:
         _raise_unauthorized(f"JWT must be a {expected_token_type} token.")
@@ -930,6 +1080,7 @@ def rotate_token_pair_from_refresh_token(refresh_token: str) -> Dict[str, Any]:
     role = claims.get("role")
     tenant = claims["tenant"]
     scopes = scopes_from_claims(claims)
+    dpop_jkt = dpop_jkt_from_claims(claims)
 
     consume_result = get_security_state_backend().consume_refresh_token(subject=subject, jti=jti)
     if consume_result.reused:
@@ -959,7 +1110,27 @@ def rotate_token_pair_from_refresh_token(refresh_token: str) -> Dict[str, Any]:
         tenant=tenant,
         jti=jti,
     )
-    return create_token_pair(subject=subject, role=role, tenant=tenant, scopes=scopes)
+    return create_token_pair(subject=subject, role=role, tenant=tenant, scopes=scopes, dpop_jkt=dpop_jkt)
+
+
+def invalidate_refresh_token(refresh_token: str) -> None:
+    try:
+        claims = decode_and_validate_jwt(token=refresh_token, expected_token_type="refresh")
+    except HTTPException:
+        return
+
+    subject = claims.get("sub")
+    jti = claims.get("jti")
+    if not isinstance(subject, str) or not subject or not isinstance(jti, str) or not jti:
+        return
+
+    get_security_state_backend().consume_refresh_token(subject=subject, jti=jti)
+    emit_security_event(
+        event_type="logout_refresh_revoked",
+        outcome="allow",
+        subject=subject,
+        jti=jti,
+    )
 
 
 def resolve_client_ip(request: Request) -> str:
@@ -1020,17 +1191,34 @@ async def require_jwt(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> JwtContext:
-    if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
+    enforce_origin_for_state_change(request)
+
+    token: Optional[str] = None
+    token_from_cookie = False
+
+    if credentials is not None and credentials.scheme.lower() == "bearer" and credentials.credentials:
+        token = credentials.credentials
+    else:
+        token = request.cookies.get(access_cookie_name())
+        token_from_cookie = bool(token)
+
+    if not token:
         emit_security_event(
             event_type="token_missing",
             outcome="deny",
             path=str(request.url.path),
             method=request.method,
         )
-        _raise_unauthorized("JWT bearer token is required.")
+        _raise_unauthorized("JWT is required.")
 
-    token = credentials.credentials
     claims = decode_and_validate_jwt(token=token, expected_token_type="access")
+    expected_jkt = dpop_jkt_from_claims(claims)
+    if auth_require_dpop() and not expected_jkt:
+        _raise_unauthorized("Sender-constrained token is required.")
+    validate_dpop_proof(request, expected_jkt=expected_jkt)
+
+    if token_from_cookie:
+        enforce_csrf_for_state_change(request)
 
     jwt_context = JwtContext(token=token, claims=claims)
     request.state.jwt = jwt_context
@@ -1064,6 +1252,11 @@ def validate_auth_settings() -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="At least one AUTH user must exist in the user store.",
         )
+
+    _cookie_samesite()
+    access_cookie_name()
+    refresh_cookie_name()
+    csrf_cookie_name()
 
     login_rate_limit_settings()
     validate_security_state_settings()

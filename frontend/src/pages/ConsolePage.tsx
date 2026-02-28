@@ -1,7 +1,7 @@
 import { FormEvent, useState } from "react";
 
-import { api, ApiError, pretty, setToken } from "../lib/api";
-import type { ConversationDetail, ConversationSummary, Profile, TokenPair } from "../types";
+import { api, ApiError, clearClientSecurityContext, pretty } from "../lib/api";
+import type { AuthSession, ConversationDetail, ConversationSummary, Profile } from "../types";
 
 function formatError(error: unknown): string {
   if (error instanceof ApiError) {
@@ -21,13 +21,13 @@ export function ConsolePage(): JSX.Element {
   const onLogin = async (event: FormEvent) => {
     event.preventDefault();
     try {
-      const tokenPair = await api<TokenPair>("/api/auth/login", {
+      const session = await api<AuthSession>("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: username.trim(), password }),
       });
-      setToken(tokenPair.access_token);
-      setResultText(pretty({ message: "login ok", access_expires_in: tokenPair.access_expires_in }));
+      setResultText(pretty({ message: "login ok", access_expires_in: session.access_expires_in }));
+      await onLoadProfile();
     } catch (error) {
       setResultText(formatError(error));
     }
@@ -125,9 +125,14 @@ export function ConsolePage(): JSX.Element {
             <button
               type="button"
               className="ghost"
-              onClick={() => {
-                setToken("");
-                setProfileText("Token cleared");
+              onClick={async () => {
+                try {
+                  await api<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
+                  clearClientSecurityContext();
+                  setProfileText("Session cleared");
+                } catch (error) {
+                  setProfileText(formatError(error));
+                }
               }}
             >
               Clear token

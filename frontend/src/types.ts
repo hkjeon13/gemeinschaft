@@ -1,6 +1,4 @@
-export type TokenPair = {
-  access_token: string;
-  refresh_token: string;
+export type AuthSession = {
   token_type: string;
   access_expires_in: number;
   refresh_expires_in: number;

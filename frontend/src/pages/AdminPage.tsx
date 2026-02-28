@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
-import { api, ApiError, pretty, setToken } from "../lib/api";
-import type { AdminUser, Profile, TokenPair } from "../types";
+import { api, ApiError, clearClientSecurityContext, pretty } from "../lib/api";
+import type { AdminUser, AuthSession, Profile } from "../types";
 
 type AdminMode = "loading" | "login" | "denied" | "dashboard";
 
@@ -30,8 +30,13 @@ export function AdminPage(): JSX.Element {
     return `Logged in as '${profile.sub}' with role '${profile.role ?? "unknown"}'. Admin role is required.`;
   }, [profile]);
 
-  const resetToLogin = () => {
-    setToken("");
+  const resetToLogin = async () => {
+    try {
+      await api<{ ok: boolean }>("/api/auth/logout", { method: "POST" });
+    } catch {
+      // Best effort logout.
+    }
+    clearClientSecurityContext();
     setLoginPassword("");
     setProfile(null);
     setUsers([]);
@@ -51,12 +56,6 @@ export function AdminPage(): JSX.Element {
   };
 
   const evaluateSession = async () => {
-    const hasToken = Boolean(localStorage.getItem("access_token"));
-    if (!hasToken) {
-      setMode("login");
-      return;
-    }
-
     try {
       const me = await api<Profile>("/api/auth/me");
       setProfile(me);
@@ -71,7 +70,6 @@ export function AdminPage(): JSX.Element {
       setMode("dashboard");
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
-        setToken("");
         setMode("login");
         return;
       }
@@ -87,14 +85,13 @@ export function AdminPage(): JSX.Element {
   const onLogin = async (event: FormEvent) => {
     event.preventDefault();
     try {
-      const tokenPair = await api<TokenPair>("/api/auth/login", {
+      const session = await api<AuthSession>("/api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username: loginUsername.trim(), password: loginPassword }),
       });
 
-      setToken(tokenPair.access_token);
-      setResultText(pretty({ message: "login ok", access_expires_in: tokenPair.access_expires_in }));
+      setResultText(pretty({ message: "login ok", access_expires_in: session.access_expires_in }));
       await evaluateSession();
     } catch (error) {
       setResultText(formatError(error));
@@ -169,10 +166,10 @@ export function AdminPage(): JSX.Element {
           <h2>Access denied</h2>
           <p className="muted">{deniedMessage}</p>
           <div className="stack admin-actions-row">
-            <button type="button" onClick={resetToLogin}>
+            <button type="button" onClick={() => void resetToLogin()}>
               관리자로 로그인
             </button>
-            <button type="button" className="ghost" onClick={resetToLogin}>
+            <button type="button" className="ghost" onClick={() => void resetToLogin()}>
               로그아웃
             </button>
           </div>
@@ -205,7 +202,7 @@ export function AdminPage(): JSX.Element {
                 >
                   Reload users
                 </button>
-                <button type="button" className="ghost" onClick={resetToLogin}>
+                <button type="button" className="ghost" onClick={() => void resetToLogin()}>
                   Logout
                 </button>
               </div>

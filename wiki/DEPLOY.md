@@ -56,10 +56,11 @@ Then verify:
 
 ```bash
 curl -s http://localhost:10015/api/auth/.well-known/jwks.json
-curl -s -X POST http://localhost:10015/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"psyche","password":"psyche-pass"}'
 ```
+
+Open browser and verify via UI:
+- `http://localhost:10015/` (console login)
+- `http://localhost:10015/admin` (admin dashboard)
 
 ## 1) Prerequisites
 
@@ -84,6 +85,10 @@ Edit `.env` and set at least:
 - `POSTGRES_PASSWORD` (strong value)
 - `JWT_ACTIVE_KID` (must exist in `secrets/jwt_private_keys.json`)
 - `AUTH_USERS_FILE=/run/secrets/auth_users.json`
+- `AUTH_COOKIE_SECURE=true` (production HTTPS). For local HTTP testing only, set `AUTH_COOKIE_SECURE=false`.
+- `AUTH_REQUIRE_CSRF=true`
+- `AUTH_REQUIRE_DPOP=true`
+- `AUTH_ALLOWED_ORIGINS=https://dataset.fin-ally.net`
 
 Optional but recommended:
 - `JWT_ISSUER`, `JWT_AUDIENCE`
@@ -156,18 +161,13 @@ curl -s http://localhost:10015/api/auth/.well-known/jwks.json
 
 ### 6.2 Login and JWT check
 
-```bash
-curl -s -X POST http://localhost:10015/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"psyche","password":"psyche-pass"}'
-```
+Because CSRF + DPoP are enabled by default, browser UI is the recommended test path:
+- `http://localhost:10015/`
+- `http://localhost:10015/admin`
 
-Use returned `access_token`:
-
-```bash
-curl -s http://localhost:10015/api/auth/me \
-  -H "Authorization: Bearer <ACCESS_TOKEN>"
-```
+If you need raw curl checks temporarily, disable DPoP in `.env` for that session:
+- `AUTH_REQUIRE_DPOP=false`
+- then redeploy and run curl tests.
 
 ### 6.3 Authorization check (scope enforced)
 
