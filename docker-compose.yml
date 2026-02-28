@@ -1,0 +1,99 @@
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file:
+    - .env
+  environment:
+    SERVICE_HOST: "0.0.0.0"
+    DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/gemeinschaft"
+    OBJECT_STORAGE_PROVIDER: "local_fs"
+    OBJECT_STORAGE_ROOT: "/data/object_storage"
+    EXPORT_STORAGE_DIR: "/data/exports"
+    AGENT_RUNTIME_BASE_URL: "http://agent_runtime:8002"
+    CONVERSATION_ORCHESTRATOR_BASE_URL: "http://conversation_orchestrator:8001"
+  volumes:
+    - object_storage:/data/object_storage
+    - export_storage:/data/exports
+
+x-app-common: &app-common
+  <<: *common
+  depends_on:
+    postgres:
+      condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: gemeinschaft
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gemeinschaft"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *common
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "scripts/migrate.py", "up"]
+    restart: "no"
+
+  api_gateway:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.api_gateway.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+
+  conversation_orchestrator:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.conversation_orchestrator.app:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "8001:8001"
+
+  agent_runtime:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.agent_runtime.app:app", "--host", "0.0.0.0", "--port", "8002"]
+    ports:
+      - "8002:8002"
+
+  data_ingestion:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.data_ingestion.app:app", "--host", "0.0.0.0", "--port", "8003"]
+    ports:
+      - "8003:8003"
+
+  topic_pipeline:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.topic_pipeline.app:app", "--host", "0.0.0.0", "--port", "8004"]
+    ports:
+      - "8004:8004"
+
+  export_service:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.export_service.app:app", "--host", "0.0.0.0", "--port", "8005"]
+    ports:
+      - "8005:8005"
+
+  scheduler:
+    <<: *app-common
+    command: ["python", "-m", "uvicorn", "services.scheduler.app:app", "--host", "0.0.0.0", "--port", "8006"]
+    ports:
+      - "8006:8006"
+
+volumes:
+  postgres_data:
+  object_storage:
+  export_storage:

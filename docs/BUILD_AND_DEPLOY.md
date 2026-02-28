@@ -1,7 +1,7 @@
 # Build & Deploy Guide
 
 `gemeinschaft`는 Python 3.12 + FastAPI 기반의 멀티 서비스 애플리케이션입니다.
-현재 저장소에는 Docker/Kubernetes 매니페스트가 없으므로, 이 문서는 "소스 배포 + 프로세스 매니저(systemd 등)" 기준으로 작성합니다.
+저장소 루트의 `docker-compose.yml`로 컨테이너 실행이 가능하며, 이 문서는 운영 배포 관점에서 "소스 배포 + 프로세스 매니저(systemd 등)" 기준을 설명합니다.
 
 ## 1. 사전 준비
 
@@ -15,6 +15,16 @@
 
 - Linux 서버에서 `systemd`로 서비스 관리
 - 배포 계정 전용 가상환경 사용
+
+## 1.1 Docker Compose로 빠르게 실행(로컬/스테이징)
+
+```bash
+cp .env.example .env
+docker compose up --build -d
+docker compose ps
+```
+
+`docker-compose.yml`에는 `postgres`, `migrate`, 7개 앱 서비스가 포함되어 있으며, `migrate`가 선행 실행되어 DB 스키마를 적용합니다.
 
 ## 2. 빌드(의존성 설치 + 아티팩트 생성)
 
