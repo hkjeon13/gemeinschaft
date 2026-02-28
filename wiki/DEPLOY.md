@@ -3,6 +3,7 @@
 This document describes production-style deployment for this project with:
 - `frontend` (static UI + `/api` reverse proxy, port `10015`)
 - `app` (FastAPI)
+- `valkey` (Redis-compatible hot conversation store)
 - `postgres` (separate Docker service)
 - RS256 JWT keys and auth user data mounted from `./secrets`
 
@@ -72,6 +73,7 @@ Open browser and verify via UI:
 - Ports available:
   - `10015` for frontend (or your custom `FRONTEND_PORT`)
   - `8000` for app (or your custom `APP_PORT`)
+  - `6379` for valkey (or your custom `VALKEY_PORT`)
   - `5432` for postgres (or your custom `POSTGRES_PORT`)
 - Local files:
   - `.env`
@@ -94,6 +96,9 @@ Edit `.env` and set at least:
 - `AUTH_REQUIRE_CSRF=true`
 - `AUTH_REQUIRE_DPOP=true`
 - `AUTH_ALLOWED_ORIGINS=https://dataset.fin-ally.net`
+- `CONVERSATION_STORE_BACKEND=hybrid`
+- `CONVERSATION_HYBRID_REDIS_URL=redis://valkey:6379/0`
+- `CONVERSATION_HYBRID_IDLE_SECONDS=1800` (example: 30m idle flush to Postgres)
 
 Optional but recommended:
 - `JWT_ISSUER`, `JWT_AUDIENCE`

@@ -10,6 +10,10 @@ from .api import router
 from .services.auth import validate_auth_settings
 from .services.authorization import validate_authorization_settings
 from .services.chat_model_registry import initialize_chat_model_registry
+from .services.conversation_store import (
+    shutdown_conversation_store,
+    start_conversation_store_background_tasks,
+)
 from .services.database import validate_database_settings
 from .services.security_state import initialize_security_state
 
@@ -59,7 +63,13 @@ async def startup_validate_auth_settings() -> None:
     validate_authorization_settings()
     validate_database_settings()
     initialize_chat_model_registry()
+    start_conversation_store_background_tasks()
     initialize_security_state()
+
+
+@app.on_event("shutdown")
+async def shutdown_conversation_background_tasks() -> None:
+    shutdown_conversation_store()
 
 
 @app.get("/docs", include_in_schema=False)

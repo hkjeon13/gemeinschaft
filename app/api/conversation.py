@@ -2,12 +2,14 @@ import json
 from typing import Any, AsyncIterator, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.schemas.conversation import (
     ConversationDetailSchema,
     ConversationSummarySchema,
     MessageCreateSchema,
+    MessageInputSchema,
 )
 from app.services.async_openai_chat_model import AsyncOpenAIChatModel
 from app.services.authorization import AccessContext, authorize_action, require_access_context
@@ -75,6 +77,42 @@ def _conversation_to_openai_messages(conversation: dict[str, Any], max_messages:
     return converted
 
 
+def _message_input_to_text(item: MessageInputSchema) -> str:
+    pieces: list[str] = []
+    for part in item.content:
+        if part.type != "text":
+            continue
+        text = part.text.strip()
+        if text:
+            pieces.append(text)
+    return "\n".join(pieces).strip()
+
+
+def _resolve_user_input(payload: MessageCreateSchema) -> str:
+    if payload.messages:
+        for item in reversed(payload.messages):
+            if item.role != "user":
+                continue
+            text = _message_input_to_text(item)
+            if text:
+                return text
+
+        for item in reversed(payload.messages):
+            text = _message_input_to_text(item)
+            if text:
+                return text
+
+    if payload.message:
+        text = payload.message.strip()
+        if text:
+            return text
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="A non-empty user text is required in `messages[].content[].text` or `message`.",
+    )
+
+
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
@@ -99,7 +137,8 @@ async def _stream_assistant_reply(
 
     full_text = "".join(chunks).strip()
     if full_text:
-        conversation_store.append_message(
+        await run_in_threadpool(
+            conversation_store.append_message,
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id=conversation_id,
@@ -112,13 +151,18 @@ async def _stream_assistant_reply(
 @conversation_router.get("/list", response_model=List[ConversationSummarySchema])
 async def conversation_list(access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:list")
-    return conversation_store.list_conversations(tenant_id=access.tenant, user_id=access.subject)
+    return await run_in_threadpool(
+        conversation_store.list_conversations,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
 
 
 @conversation_router.get("/{conversation_id}", response_model=ConversationDetailSchema)
 async def get_dialogue(conversation_id: str, access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:get", resource_id=conversation_id)
-    conversation = conversation_store.get_conversation(
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
         tenant_id=access.tenant,
         user_id=access.subject,
         conversation_id=conversation_id,
@@ -136,14 +180,16 @@ async def create_dialogue(
     access: AccessContext = Depends(require_access_context),
 ):
     authorize_action(access, action="conversation:create", resource_id=conversation_id)
-    conversation = conversation_store.append_message(
+    user_message = _resolve_user_input(payload)
+    conversation = await run_in_threadpool(
+        conversation_store.append_message,
         tenant_id=access.tenant,
         user_id=access.subject,
         conversation_id=conversation_id,
-        message=payload.message,
+        message=user_message,
         role="user",
     )
-    selected_model = resolve_chat_model(payload.model_id)
+    selected_model = await run_in_threadpool(resolve_chat_model, payload.model_id)
     if selected_model.provider != "openai":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -177,7 +223,8 @@ async def create_dialogue(
         )
 
     if assistant_reply.strip():
-        conversation = conversation_store.append_message(
+        conversation = await run_in_threadpool(
+            conversation_store.append_message,
             tenant_id=access.tenant,
             user_id=access.subject,
             conversation_id=conversation_id,

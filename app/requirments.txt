@@ -5,3 +5,4 @@ bcrypt>=3.2,<5
 psycopg[binary]>=3.2,<4
 cryptography>=37,<45
 openai>=1.0,<2
+redis>=5,<7

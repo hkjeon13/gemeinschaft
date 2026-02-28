@@ -19,6 +19,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     volumes:
       - ./secrets:/run/secrets:ro
     ports:
@@ -41,6 +43,13 @@ services:
       AUTH_USERS_FILE: "${AUTH_USERS_FILE:-/run/secrets/auth_users.json}"
       AUTH_USERS_JSON: "${AUTH_USERS_JSON:-}"
       AUTH_USER_STORE_BACKEND: "${AUTH_USER_STORE_BACKEND:-}"
+      CONVERSATION_STORE_BACKEND: "${CONVERSATION_STORE_BACKEND:-hybrid}"
+      CONVERSATION_HYBRID_REDIS_URL: "${CONVERSATION_HYBRID_REDIS_URL:-redis://valkey:6379/0}"
+      CONVERSATION_HYBRID_REDIS_PREFIX: "${CONVERSATION_HYBRID_REDIS_PREFIX:-conversation_hot}"
+      CONVERSATION_HYBRID_IDLE_SECONDS: "${CONVERSATION_HYBRID_IDLE_SECONDS:-1800}"
+      CONVERSATION_HYBRID_FLUSH_INTERVAL_SECONDS: "${CONVERSATION_HYBRID_FLUSH_INTERVAL_SECONDS:-30}"
+      CONVERSATION_HYBRID_FLUSH_BATCH_SIZE: "${CONVERSATION_HYBRID_FLUSH_BATCH_SIZE:-100}"
+      CONVERSATION_HYBRID_WRITE_THROUGH: "${CONVERSATION_HYBRID_WRITE_THROUGH:-false}"
       AUTH_ACCESS_COOKIE_NAME: "${AUTH_ACCESS_COOKIE_NAME:-access_token}"
       AUTH_REFRESH_COOKIE_NAME: "${AUTH_REFRESH_COOKIE_NAME:-refresh_token}"
       AUTH_COOKIE_SECURE: "${AUTH_COOKIE_SECURE:-true}"
@@ -87,6 +96,19 @@ services:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gemeinschaft} -d ${POSTGRES_DB:-gemeinschaft}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  valkey:
+    image: redis:7-alpine
+    container_name: gemeinschaft-valkey
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

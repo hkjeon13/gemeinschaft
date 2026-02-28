@@ -1,13 +1,66 @@
-from datetime import datetime, timezone
-from threading import Lock
-from typing import Any, Dict, List, Optional
+import json
+import logging
+import os
+import time
 import uuid
+from datetime import datetime, timezone
+from threading import Event, Lock, Thread
+from typing import Any, Dict, List, Optional
+
+from fastapi import HTTPException, status
+
+from .database import database_url_from_settings, load_database_settings
+
+try:
+    import psycopg
+except ImportError:  # pragma: no cover - installed in runtime image
+    psycopg = None
+
+try:
+    import redis
+except ImportError:  # pragma: no cover - installed in runtime image
+    redis = None
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_ROLES = {"user", "assistant", "system"}
 
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return _now_utc().isoformat().replace("+00:00", "Z")
+
+
+def _to_iso(value: Any) -> str:
+    if hasattr(value, "isoformat"):
+        return value.isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _parse_iso_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value or "").strip()
+        if not text:
+            return _now_utc()
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return _now_utc()
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _to_epoch(value: Any) -> float:
+    return _parse_iso_datetime(value).timestamp()
 
 
 def _normalize_role(role: str) -> str:
@@ -30,10 +83,84 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-class ConversationStore:
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    fallback = "true" if default else "false"
+    raw = os.getenv(name, fallback)
+    return _truthy(raw)
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{name} must be an integer.",
+        )
+
+    if value < minimum:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{name} must be >= {minimum}.",
+        )
+    return value
+
+
+def _conversation_store_backend_name() -> str:
+    configured = os.getenv("CONVERSATION_STORE_BACKEND", "").strip().lower()
+    if configured:
+        if configured == "redis":
+            configured = "hybrid"
+        if configured not in ("postgres", "memory", "hybrid"):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="CONVERSATION_STORE_BACKEND must be 'postgres', 'memory', or 'hybrid'.",
+            )
+        return configured
+
+    settings = load_database_settings()
+    return "postgres" if settings.enabled else "memory"
+
+
+class ConversationStoreBackend:
+    def init_schema(self) -> None:
+        raise NotImplementedError
+
+    def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def append_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        role: str,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def start_background_tasks(self) -> None:
+        return
+
+    def stop_background_tasks(self) -> None:
+        return
+
+
+class InMemoryConversationStore(ConversationStoreBackend):
     def __init__(self) -> None:
         self._lock = Lock()
         self._conversations_by_tenant: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+
+    def init_schema(self) -> None:
+        return
 
     def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
         with self._lock:
@@ -73,7 +200,7 @@ class ConversationStore:
         user_id: str,
         conversation_id: str,
         message: str,
-        role: str = "user",
+        role: str,
     ) -> Dict[str, Any]:
         now = _now_iso()
         entry = _normalized_message(
@@ -105,6 +232,850 @@ class ConversationStore:
                 "messages": [_normalized_message(item) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
+
+
+class PostgresConversationStore(ConversationStoreBackend):
+    def _dsn(self) -> str:
+        settings = load_database_settings()
+        if not settings.enabled:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="DATABASE_ENABLED must be true when using Postgres conversation storage.",
+            )
+        return database_url_from_settings(settings)
+
+    def _connect(self):
+        if psycopg is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="psycopg is required for postgres conversation store.",
+            )
+        try:
+            return psycopg.connect(self._dsn())
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to connect to Postgres for conversation store.",
+            )
+
+    def init_schema(self) -> None:
+        ddl = """
+        CREATE TABLE IF NOT EXISTS conversations (
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (tenant_id, user_id, conversation_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_conversations_tenant_user_updated
+            ON conversations(tenant_id, user_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            message_id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            message TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            FOREIGN KEY (tenant_id, user_id, conversation_id)
+                REFERENCES conversations(tenant_id, user_id, conversation_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages_lookup
+            ON conversation_messages(tenant_id, user_id, conversation_id, created_at ASC, message_id ASC);
+        """
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(ddl)
+            conn.commit()
+
+    def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT c.conversation_id, COUNT(m.message_id) AS message_count, c.updated_at
+                    FROM conversations c
+                    LEFT JOIN conversation_messages m
+                      ON c.tenant_id = m.tenant_id
+                     AND c.user_id = m.user_id
+                     AND c.conversation_id = m.conversation_id
+                    WHERE c.tenant_id = %s AND c.user_id = %s
+                    GROUP BY c.conversation_id, c.updated_at
+                    ORDER BY c.updated_at DESC
+                    """,
+                    (tenant_id, user_id),
+                )
+                rows = cur.fetchall()
+            conn.commit()
+
+        return [
+            {
+                "conversation_id": row[0],
+                "message_count": int(row[1] or 0),
+                "updated_at": _to_iso(row[2]),
+            }
+            for row in rows
+        ]
+
+    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            payload = self._fetch_conversation(conn, tenant_id, user_id, conversation_id)
+            conn.commit()
+        return payload
+
+    def append_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        role: str,
+    ) -> Dict[str, Any]:
+        normalized_role = _normalize_role(role)
+        message_text = str(message)
+        message_id = uuid.uuid4().hex
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at)
+                    VALUES (%s, %s, %s, NOW())
+                    ON CONFLICT (tenant_id, user_id, conversation_id)
+                    DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    """,
+                    (tenant_id, user_id, conversation_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO conversation_messages (
+                        message_id, tenant_id, user_id, conversation_id, role, message, created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (message_id, tenant_id, user_id, conversation_id, normalized_role, message_text),
+                )
+
+            payload = self._fetch_conversation(conn, tenant_id, user_id, conversation_id)
+            conn.commit()
+
+        if payload is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to load conversation after append.",
+            )
+        return payload
+
+    def replace_conversation(self, conversation: Dict[str, Any]) -> None:
+        tenant_id = str(conversation.get("tenant_id") or "").strip()
+        user_id = str(conversation.get("user_id") or "").strip()
+        conversation_id = str(conversation.get("conversation_id") or "").strip()
+        if not tenant_id or not user_id or not conversation_id:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Invalid conversation payload for postgres replace.",
+            )
+
+        updated_at = _parse_iso_datetime(conversation.get("updated_at"))
+        raw_messages = conversation.get("messages", [])
+        messages = [item for item in raw_messages if isinstance(item, dict)]
+
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (tenant_id, user_id, conversation_id)
+                    DO UPDATE SET updated_at = EXCLUDED.updated_at
+                    """,
+                    (tenant_id, user_id, conversation_id, updated_at),
+                )
+
+                cur.execute(
+                    """
+                    DELETE FROM conversation_messages
+                    WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
+                    """,
+                    (tenant_id, user_id, conversation_id),
+                )
+
+                for item in messages:
+                    normalized = _normalized_message(item)
+                    message_id = normalized["message_id"].strip() or uuid.uuid4().hex
+                    role = _normalize_role(normalized["role"])
+                    message_text = normalized["message"]
+                    created_at = _parse_iso_datetime(normalized["created_at"])
+
+                    cur.execute(
+                        """
+                        INSERT INTO conversation_messages (
+                            message_id, tenant_id, user_id, conversation_id, role, message, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (message_id, tenant_id, user_id, conversation_id, role, message_text, created_at),
+                    )
+
+            conn.commit()
+
+    def _fetch_conversation(
+        self,
+        conn: Any,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT conversation_id, updated_at
+                FROM conversations
+                WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
+                """,
+                (tenant_id, user_id, conversation_id),
+            )
+            header = cur.fetchone()
+            if header is None:
+                return None
+
+            cur.execute(
+                """
+                SELECT message_id, role, message, created_at
+                FROM conversation_messages
+                WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
+                ORDER BY created_at ASC, message_id ASC
+                """,
+                (tenant_id, user_id, conversation_id),
+            )
+            rows = cur.fetchall()
+
+        messages = [
+            _normalized_message(
+                {
+                    "message_id": row[0],
+                    "role": row[1],
+                    "message": row[2],
+                    "created_at": _to_iso(row[3]),
+                }
+            )
+            for row in rows
+        ]
+
+        return {
+            "conversation_id": header[0],
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "messages": messages,
+            "updated_at": _to_iso(header[1]),
+        }
+
+
+class RedisHotConversationStore:
+    def __init__(self) -> None:
+        self._client = None
+
+    def _redis_url(self) -> str:
+        return os.getenv("CONVERSATION_HYBRID_REDIS_URL", "redis://valkey:6379/0").strip()
+
+    def _prefix(self) -> str:
+        value = os.getenv("CONVERSATION_HYBRID_REDIS_PREFIX", "conversation_hot").strip()
+        return value or "conversation_hot"
+
+    def _client_or_raise(self):
+        if redis is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="redis package is required when CONVERSATION_STORE_BACKEND=hybrid.",
+            )
+
+        if self._client is None:
+            try:
+                self._client = redis.Redis.from_url(self._redis_url(), decode_responses=True)
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to initialize Redis/Valkey client.",
+                )
+        return self._client
+
+    def init(self) -> None:
+        client = self._client_or_raise()
+        try:
+            client.ping()
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to connect to Redis/Valkey for hybrid conversation store.",
+            )
+
+    def _conversation_key(self, tenant_id: str, user_id: str, conversation_id: str) -> str:
+        return f"{self._prefix()}:conversation:{tenant_id}:{user_id}:{conversation_id}"
+
+    def _user_index_key(self, tenant_id: str, user_id: str) -> str:
+        return f"{self._prefix()}:user:{tenant_id}:{user_id}:conversations"
+
+    def _active_index_key(self) -> str:
+        return f"{self._prefix()}:active"
+
+    def _serialize(
+        self,
+        conversation: Dict[str, Any],
+        *,
+        dirty: bool,
+        last_activity_epoch: float,
+    ) -> str:
+        normalized_messages = [
+            _normalized_message(item) for item in conversation.get("messages", []) if isinstance(item, dict)
+        ]
+        payload = {
+            "conversation_id": str(conversation.get("conversation_id") or ""),
+            "tenant_id": str(conversation.get("tenant_id") or ""),
+            "user_id": str(conversation.get("user_id") or ""),
+            "messages": normalized_messages,
+            "updated_at": str(conversation.get("updated_at") or _now_iso()),
+            "_dirty": bool(dirty),
+            "_last_activity_epoch": float(last_activity_epoch),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _deserialize(self, raw: str) -> Optional[Dict[str, Any]]:
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            messages = []
+
+        raw_last_activity_epoch = payload.get("_last_activity_epoch")
+        try:
+            last_activity_epoch = float(raw_last_activity_epoch)
+        except (TypeError, ValueError):
+            last_activity_epoch = time.time()
+
+        normalized = {
+            "conversation_id": str(payload.get("conversation_id") or "").strip(),
+            "tenant_id": str(payload.get("tenant_id") or "").strip(),
+            "user_id": str(payload.get("user_id") or "").strip(),
+            "messages": [_normalized_message(item) for item in messages if isinstance(item, dict)],
+            "updated_at": str(payload.get("updated_at") or _now_iso()),
+            "_dirty": bool(payload.get("_dirty", False)),
+            "_last_activity_epoch": last_activity_epoch,
+        }
+        if not normalized["conversation_id"] or not normalized["tenant_id"] or not normalized["user_id"]:
+            return None
+        return normalized
+
+    def _public_payload(self, cached: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "conversation_id": cached["conversation_id"],
+            "tenant_id": cached["tenant_id"],
+            "user_id": cached["user_id"],
+            "messages": [_normalized_message(item) for item in cached.get("messages", [])],
+            "updated_at": cached["updated_at"],
+        }
+
+    def cache_conversation(
+        self,
+        conversation: Dict[str, Any],
+        *,
+        dirty: bool,
+        last_activity_epoch: Optional[float] = None,
+    ) -> None:
+        tenant_id = str(conversation.get("tenant_id") or "").strip()
+        user_id = str(conversation.get("user_id") or "").strip()
+        conversation_id = str(conversation.get("conversation_id") or "").strip()
+        if not tenant_id or not user_id or not conversation_id:
+            return
+
+        updated_at = str(conversation.get("updated_at") or _now_iso())
+        updated_at_epoch = _to_epoch(updated_at)
+        activity_epoch = time.time() if last_activity_epoch is None else float(last_activity_epoch)
+
+        record = {
+            "conversation_id": conversation_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "messages": [_normalized_message(item) for item in conversation.get("messages", []) if isinstance(item, dict)],
+            "updated_at": updated_at,
+        }
+
+        serialized = self._serialize(record, dirty=dirty, last_activity_epoch=activity_epoch)
+        conversation_key = self._conversation_key(tenant_id, user_id, conversation_id)
+        user_index = self._user_index_key(tenant_id, user_id)
+        active_index = self._active_index_key()
+
+        client = self._client_or_raise()
+        with client.pipeline() as pipe:
+            pipe.set(conversation_key, serialized)
+            pipe.zadd(user_index, {conversation_id: updated_at_epoch})
+            pipe.zadd(active_index, {conversation_key: activity_epoch})
+            pipe.execute()
+
+    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+        conversation_key = self._conversation_key(tenant_id, user_id, conversation_id)
+        client = self._client_or_raise()
+        raw = client.get(conversation_key)
+        if raw is None:
+            return None
+
+        cached = self._deserialize(raw)
+        if cached is None:
+            self.delete_cached_conversation(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
+            return None
+
+        return self._public_payload(cached)
+
+    def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+        client = self._client_or_raise()
+        user_index = self._user_index_key(tenant_id, user_id)
+        conversation_ids = [str(item) for item in client.zrevrange(user_index, 0, -1)]
+        if not conversation_ids:
+            return []
+
+        conversation_keys = [
+            self._conversation_key(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
+            for conversation_id in conversation_ids
+        ]
+        raws = client.mget(conversation_keys)
+
+        stale_ids: List[str] = []
+        summaries: List[Dict[str, Any]] = []
+        for conversation_id, raw in zip(conversation_ids, raws):
+            if raw is None:
+                stale_ids.append(conversation_id)
+                continue
+
+            cached = self._deserialize(raw)
+            if cached is None:
+                stale_ids.append(conversation_id)
+                continue
+
+            summaries.append(
+                {
+                    "conversation_id": cached["conversation_id"],
+                    "message_count": len(cached.get("messages", [])),
+                    "updated_at": cached["updated_at"],
+                }
+            )
+
+        if stale_ids:
+            client.zrem(user_index, *stale_ids)
+
+        summaries.sort(key=lambda item: _to_epoch(item["updated_at"]), reverse=True)
+        return summaries
+
+    def append_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        role: str,
+    ) -> Dict[str, Any]:
+        now_iso = _now_iso()
+        now_epoch = time.time()
+        normalized_role = _normalize_role(role)
+
+        existing = self.get_conversation(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
+        if existing is None:
+            existing = {
+                "conversation_id": conversation_id,
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "messages": [],
+                "updated_at": now_iso,
+            }
+
+        entry = _normalized_message(
+            {
+                "message_id": uuid.uuid4().hex,
+                "role": normalized_role,
+                "message": str(message),
+                "created_at": now_iso,
+            }
+        )
+
+        existing_messages = [item for item in existing.get("messages", []) if isinstance(item, dict)]
+        existing_messages.append(entry)
+        updated = {
+            "conversation_id": conversation_id,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "messages": existing_messages,
+            "updated_at": now_iso,
+        }
+
+        self.cache_conversation(updated, dirty=True, last_activity_epoch=now_epoch)
+        return updated
+
+    def delete_cached_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> None:
+        client = self._client_or_raise()
+        conversation_key = self._conversation_key(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
+        user_index = self._user_index_key(tenant_id=tenant_id, user_id=user_id)
+        active_index = self._active_index_key()
+
+        with client.pipeline() as pipe:
+            pipe.delete(conversation_key)
+            pipe.zrem(user_index, conversation_id)
+            pipe.zrem(active_index, conversation_key)
+            pipe.execute()
+
+    def flush_idle_conversations(
+        self,
+        *,
+        postgres_store: PostgresConversationStore,
+        idle_seconds: int,
+        batch_size: int,
+    ) -> int:
+        if batch_size <= 0:
+            return 0
+
+        client = self._client_or_raise()
+        active_index = self._active_index_key()
+        cutoff = time.time() - max(0, idle_seconds)
+
+        conversation_keys = client.zrangebyscore(active_index, min="-inf", max=cutoff, start=0, num=batch_size)
+        if not conversation_keys:
+            return 0
+
+        processed = 0
+        for conversation_key in conversation_keys:
+            score = client.zscore(active_index, conversation_key)
+            if score is None:
+                continue
+            if float(score) > cutoff:
+                continue
+
+            raw = client.get(conversation_key)
+            if raw is None:
+                client.zrem(active_index, conversation_key)
+                continue
+
+            cached = self._deserialize(raw)
+            if cached is None:
+                client.delete(conversation_key)
+                client.zrem(active_index, conversation_key)
+                continue
+
+            if cached.get("_dirty"):
+                postgres_store.replace_conversation(self._public_payload(cached))
+
+            self.delete_cached_conversation(
+                tenant_id=cached["tenant_id"],
+                user_id=cached["user_id"],
+                conversation_id=cached["conversation_id"],
+            )
+            processed += 1
+
+        return processed
+
+
+class HybridConversationStore(ConversationStoreBackend):
+    def __init__(self) -> None:
+        self._cold_store = PostgresConversationStore()
+        self._hot_store = RedisHotConversationStore()
+        self._flush_thread: Optional[Thread] = None
+        self._flush_stop = Event()
+        self._flush_lock = Lock()
+
+    def _idle_seconds(self) -> int:
+        return _env_int("CONVERSATION_HYBRID_IDLE_SECONDS", default=1800, minimum=0)
+
+    def _flush_batch_size(self) -> int:
+        return _env_int("CONVERSATION_HYBRID_FLUSH_BATCH_SIZE", default=100, minimum=1)
+
+    def _flush_interval_seconds(self) -> int:
+        return _env_int("CONVERSATION_HYBRID_FLUSH_INTERVAL_SECONDS", default=30, minimum=0)
+
+    def _write_through(self) -> bool:
+        return _env_bool("CONVERSATION_HYBRID_WRITE_THROUGH", default=False)
+
+    def init_schema(self) -> None:
+        self._cold_store.init_schema()
+        self._hot_store.init()
+
+    def _flush_idle_best_effort(self) -> None:
+        try:
+            self.flush_idle_once()
+        except Exception:
+            logger.exception("Hybrid conversation idle flush failed.")
+
+    def flush_idle_once(self) -> int:
+        return self._hot_store.flush_idle_conversations(
+            postgres_store=self._cold_store,
+            idle_seconds=self._idle_seconds(),
+            batch_size=self._flush_batch_size(),
+        )
+
+    def flush_all_hot(self) -> int:
+        flushed = 0
+        while True:
+            count = self._hot_store.flush_idle_conversations(
+                postgres_store=self._cold_store,
+                idle_seconds=0,
+                batch_size=self._flush_batch_size(),
+            )
+            if count <= 0:
+                break
+            flushed += count
+        return flushed
+
+    def _run_flush_loop(self, interval_seconds: int) -> None:
+        while not self._flush_stop.wait(interval_seconds):
+            self._flush_idle_best_effort()
+
+    def start_background_tasks(self) -> None:
+        interval_seconds = self._flush_interval_seconds()
+        if interval_seconds <= 0:
+            return
+
+        with self._flush_lock:
+            if self._flush_thread is not None and self._flush_thread.is_alive():
+                return
+
+            self._flush_stop.clear()
+            self._flush_thread = Thread(
+                target=self._run_flush_loop,
+                args=(interval_seconds,),
+                name="conversation-hybrid-flusher",
+                daemon=True,
+            )
+            self._flush_thread.start()
+
+    def stop_background_tasks(self) -> None:
+        thread: Optional[Thread]
+        with self._flush_lock:
+            thread = self._flush_thread
+            self._flush_thread = None
+            self._flush_stop.set()
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3)
+
+        try:
+            self.flush_all_hot()
+        except Exception:
+            logger.exception("Failed to flush hot conversations during shutdown.")
+
+    def _merge_summaries(
+        self,
+        cold_list: List[Dict[str, Any]],
+        hot_list: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+
+        for item in cold_list:
+            conversation_id = str(item.get("conversation_id") or "").strip()
+            if not conversation_id:
+                continue
+            merged[conversation_id] = {
+                "conversation_id": conversation_id,
+                "message_count": int(item.get("message_count", 0) or 0),
+                "updated_at": str(item.get("updated_at") or _now_iso()),
+            }
+
+        for item in hot_list:
+            conversation_id = str(item.get("conversation_id") or "").strip()
+            if not conversation_id:
+                continue
+            next_summary = {
+                "conversation_id": conversation_id,
+                "message_count": int(item.get("message_count", 0) or 0),
+                "updated_at": str(item.get("updated_at") or _now_iso()),
+            }
+            existing = merged.get(conversation_id)
+            if existing is None:
+                merged[conversation_id] = next_summary
+                continue
+
+            if _to_epoch(next_summary["updated_at"]) >= _to_epoch(existing["updated_at"]):
+                merged[conversation_id] = next_summary
+
+        summaries = list(merged.values())
+        summaries.sort(key=lambda item: _to_epoch(item["updated_at"]), reverse=True)
+        return summaries
+
+    def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+        self._flush_idle_best_effort()
+
+        cold_list = self._cold_store.list_conversations(tenant_id=tenant_id, user_id=user_id)
+
+        hot_list: List[Dict[str, Any]] = []
+        try:
+            hot_list = self._hot_store.list_conversations(tenant_id=tenant_id, user_id=user_id)
+        except Exception:
+            logger.exception("Failed to read hot conversation summaries; falling back to cold store only.")
+
+        return self._merge_summaries(cold_list=cold_list, hot_list=hot_list)
+
+    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+        self._flush_idle_best_effort()
+
+        try:
+            hot = self._hot_store.get_conversation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+            if hot is not None:
+                return hot
+        except Exception:
+            logger.exception("Failed to read hot conversation; checking cold store.")
+
+        cold = self._cold_store.get_conversation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+        if cold is None:
+            return None
+
+        try:
+            self._hot_store.cache_conversation(cold, dirty=False, last_activity_epoch=time.time())
+        except Exception:
+            logger.exception("Failed to warm conversation into hot store.")
+
+        return cold
+
+    def append_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        role: str,
+    ) -> Dict[str, Any]:
+        self._flush_idle_best_effort()
+
+        if self._write_through():
+            conversation = self._cold_store.append_message(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message=message,
+                role=role,
+            )
+            try:
+                self._hot_store.cache_conversation(conversation, dirty=False, last_activity_epoch=time.time())
+            except Exception:
+                logger.exception("Failed to cache write-through conversation to hot store.")
+            return conversation
+
+        try:
+            hot_existing = self._hot_store.get_conversation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+            if hot_existing is None:
+                cold_existing = self._cold_store.get_conversation(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                if cold_existing is not None:
+                    self._hot_store.cache_conversation(cold_existing, dirty=False, last_activity_epoch=time.time())
+
+            return self._hot_store.append_message(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message=message,
+                role=role,
+            )
+        except Exception:
+            logger.exception("Hybrid hot append failed; falling back to cold append.")
+            return self._cold_store.append_message(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message=message,
+                role=role,
+            )
+
+
+_memory_store = InMemoryConversationStore()
+_postgres_store = PostgresConversationStore()
+_hybrid_store = HybridConversationStore()
+
+_store_initialized = False
+_store_init_lock = Lock()
+
+
+def _get_store() -> ConversationStoreBackend:
+    backend = _conversation_store_backend_name()
+    if backend == "memory":
+        return _memory_store
+    if backend == "hybrid":
+        return _hybrid_store
+    return _postgres_store
+
+
+def initialize_conversation_store() -> None:
+    global _store_initialized
+    if _store_initialized:
+        return
+
+    with _store_init_lock:
+        if _store_initialized:
+            return
+
+        store = _get_store()
+        store.init_schema()
+        _store_initialized = True
+
+
+def start_conversation_store_background_tasks() -> None:
+    initialize_conversation_store()
+    _get_store().start_background_tasks()
+
+
+def shutdown_conversation_store() -> None:
+    if not _store_initialized:
+        return
+    _get_store().stop_background_tasks()
+
+
+class ConversationStore:
+    def list_conversations(self, tenant_id: str, user_id: str) -> List[Dict[str, Any]]:
+        initialize_conversation_store()
+        return _get_store().list_conversations(tenant_id=tenant_id, user_id=user_id)
+
+    def get_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
+        initialize_conversation_store()
+        return _get_store().get_conversation(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+        )
+
+    def append_message(
+        self,
+        tenant_id: str,
+        user_id: str,
+        conversation_id: str,
+        message: str,
+        role: str = "user",
+    ) -> Dict[str, Any]:
+        initialize_conversation_store()
+        return _get_store().append_message(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message=message,
+            role=role,
+        )
 
 
 conversation_store = ConversationStore()

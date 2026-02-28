@@ -3,8 +3,28 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class MessageContentInputSchema(BaseModel):
+    type: Literal["text"] = "text"
+    text: str = Field(..., min_length=1)
+
+
+class MessageSpeakerInputSchema(BaseModel):
+    type: Optional[str] = None
+    id: Optional[str] = None
+    name: Optional[str] = None
+
+
+class MessageInputSchema(BaseModel):
+    id: Optional[str] = None
+    role: Literal["user", "assistant", "system"] = "user"
+    speaker: Optional[MessageSpeakerInputSchema] = None
+    content: List[MessageContentInputSchema] = Field(default_factory=list)
+    timestamp: Optional[str] = None
+
+
 class MessageCreateSchema(BaseModel):
-    message: str = Field(..., min_length=1, max_length=4000)
+    message: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    messages: Optional[List[MessageInputSchema]] = None
     model_id: Optional[str] = Field(default=None, min_length=1)
 
 
