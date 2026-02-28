@@ -77,6 +77,7 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     role = entry.get("role", "user")
     model_id = entry.get("model_id")
     model_name = entry.get("model_name")
+    model_display_name = entry.get("model_display_name")
     provider = entry.get("provider")
 
     normalized = {
@@ -87,6 +88,7 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     }
     normalized["model_id"] = str(model_id).strip() if model_id is not None else None
     normalized["model_name"] = str(model_name).strip() if model_name is not None else None
+    normalized["model_display_name"] = str(model_display_name).strip() if model_display_name is not None else None
     normalized["provider"] = str(provider).strip().lower() if provider is not None else None
     return normalized
 
@@ -154,6 +156,7 @@ class ConversationStoreBackend:
         role: str,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         raise NotImplementedError
@@ -214,6 +217,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
         role: str,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = _now_iso()
@@ -225,6 +229,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 "created_at": now,
                 "model_id": model_id,
                 "model_name": model_name,
+                "model_display_name": model_display_name,
                 "provider": provider,
             }
         )
@@ -298,6 +303,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             message TEXT NOT NULL,
             model_id TEXT,
             model_name TEXT,
+            model_display_name TEXT,
             provider TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             FOREIGN KEY (tenant_id, user_id, conversation_id)
@@ -309,6 +315,8 @@ class PostgresConversationStore(ConversationStoreBackend):
             ADD COLUMN IF NOT EXISTS model_id TEXT;
         ALTER TABLE conversation_messages
             ADD COLUMN IF NOT EXISTS model_name TEXT;
+        ALTER TABLE conversation_messages
+            ADD COLUMN IF NOT EXISTS model_display_name TEXT;
         ALTER TABLE conversation_messages
             ADD COLUMN IF NOT EXISTS provider TEXT;
 
@@ -365,6 +373,7 @@ class PostgresConversationStore(ConversationStoreBackend):
         role: str,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         normalized_role = _normalize_role(role)
@@ -372,6 +381,7 @@ class PostgresConversationStore(ConversationStoreBackend):
         message_id = uuid.uuid4().hex
         normalized_model_id = str(model_id).strip() if model_id is not None else None
         normalized_model_name = str(model_name).strip() if model_name is not None else None
+        normalized_model_display_name = str(model_display_name).strip() if model_display_name is not None else None
         normalized_provider = str(provider).strip().lower() if provider is not None else None
 
         with self._connect() as conn:
@@ -389,9 +399,9 @@ class PostgresConversationStore(ConversationStoreBackend):
                     """
                     INSERT INTO conversation_messages (
                         message_id, tenant_id, user_id, conversation_id, role, message,
-                        model_id, model_name, provider, created_at
+                        model_id, model_name, model_display_name, provider, created_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     """,
                     (
                         message_id,
@@ -402,6 +412,7 @@ class PostgresConversationStore(ConversationStoreBackend):
                         message_text,
                         normalized_model_id,
                         normalized_model_name,
+                        normalized_model_display_name,
                         normalized_provider,
                     ),
                 )
@@ -466,6 +477,11 @@ class PostgresConversationStore(ConversationStoreBackend):
                         if normalized.get("model_name") is not None
                         else None
                     )
+                    model_display_name = (
+                        str(normalized.get("model_display_name")).strip()
+                        if normalized.get("model_display_name") is not None
+                        else None
+                    )
                     provider = (
                         str(normalized.get("provider")).strip().lower()
                         if normalized.get("provider") is not None
@@ -476,8 +492,8 @@ class PostgresConversationStore(ConversationStoreBackend):
                         """
                         INSERT INTO conversation_messages (
                             message_id, tenant_id, user_id, conversation_id, role, message,
-                            model_id, model_name, provider, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            model_id, model_name, model_display_name, provider, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             message_id,
@@ -488,6 +504,7 @@ class PostgresConversationStore(ConversationStoreBackend):
                             message_text,
                             model_id,
                             model_name,
+                            model_display_name,
                             provider,
                             created_at,
                         ),
@@ -517,7 +534,7 @@ class PostgresConversationStore(ConversationStoreBackend):
 
             cur.execute(
                 """
-                SELECT message_id, role, message, model_id, model_name, provider, created_at
+                SELECT message_id, role, message, model_id, model_name, model_display_name, provider, created_at
                 FROM conversation_messages
                 WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
                 ORDER BY created_at ASC, message_id ASC
@@ -534,8 +551,9 @@ class PostgresConversationStore(ConversationStoreBackend):
                     "message": row[2],
                     "model_id": row[3],
                     "model_name": row[4],
-                    "provider": row[5],
-                    "created_at": _to_iso(row[6]),
+                    "model_display_name": row[5],
+                    "provider": row[6],
+                    "created_at": _to_iso(row[7]),
                 }
             )
             for row in rows
@@ -758,6 +776,7 @@ class RedisHotConversationStore:
         role: str,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         now_iso = _now_iso()
@@ -782,6 +801,7 @@ class RedisHotConversationStore:
                 "created_at": now_iso,
                 "model_id": model_id,
                 "model_name": model_name,
+                "model_display_name": model_display_name,
                 "provider": provider,
             }
         )
@@ -1037,6 +1057,7 @@ class HybridConversationStore(ConversationStoreBackend):
         role: str,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._flush_idle_best_effort()
@@ -1050,6 +1071,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 role=role,
                 model_id=model_id,
                 model_name=model_name,
+                model_display_name=model_display_name,
                 provider=provider,
             )
             try:
@@ -1081,6 +1103,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 role=role,
                 model_id=model_id,
                 model_name=model_name,
+                model_display_name=model_display_name,
                 provider=provider,
             )
         except Exception:
@@ -1093,6 +1116,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 role=role,
                 model_id=model_id,
                 model_name=model_name,
+                model_display_name=model_display_name,
                 provider=provider,
             )
 
@@ -1161,6 +1185,7 @@ class ConversationStore:
         role: str = "user",
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         initialize_conversation_store()
@@ -1172,6 +1197,7 @@ class ConversationStore:
             role=role,
             model_id=model_id,
             model_name=model_name,
+            model_display_name=model_display_name,
             provider=provider,
         )
 

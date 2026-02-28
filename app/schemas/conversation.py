@@ -35,6 +35,7 @@ class MessageSchema(BaseModel):
     created_at: str
     model_id: Optional[str] = None
     model_name: Optional[str] = None
+    model_display_name: Optional[str] = None
     provider: Optional[str] = None
 
 
