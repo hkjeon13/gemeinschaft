@@ -1,0 +1,165 @@
+# Deployment Guide (Docker Compose)
+
+This document describes production-style deployment for this project with:
+- `app` (FastAPI)
+- `postgres` (separate Docker service)
+- RS256 JWT keys and auth user data mounted from `./secrets`
+
+## 1) Prerequisites
+
+- Docker Engine + Docker Compose v2
+- Ports available:
+  - `8000` for app (or your custom `APP_PORT`)
+  - `5432` for postgres (or your custom `POSTGRES_PORT`)
+- Local files:
+  - `.env`
+  - `secrets/jwt_private_keys.json`
+  - `secrets/jwt_public_keys.json`
+  - `secrets/auth_users.json`
+
+## 2) Prepare env file
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set at least:
+- `POSTGRES_PASSWORD` (strong value)
+- `JWT_ACTIVE_KID` (must exist in `secrets/jwt_private_keys.json`)
+- `AUTH_USERS_FILE=/run/secrets/auth_users.json`
+
+Optional but recommended:
+- `JWT_ISSUER`, `JWT_AUDIENCE`
+- `AUTH_LOGIN_MAX_ATTEMPTS`, `AUTH_LOGIN_BLOCK_SECONDS`
+- `AUTHZ_POLICIES_JSON` (if you want custom authorization policy)
+
+## 3) Prepare secrets
+
+### 3.1 Generate JWT RSA key files
+
+```bash
+python app/scripts/generate_rsa_jwt_keys.py \
+  --kid k2026_02 \
+  --private-out secrets/jwt_private_keys.json \
+  --public-out secrets/jwt_public_keys.json
+```
+
+This creates JSON like:
+- `secrets/jwt_private_keys.json`: `{ "k2026_02": "-----BEGIN PRIVATE KEY-----..." }`
+- `secrets/jwt_public_keys.json`: `{ "k2026_02": "-----BEGIN PUBLIC KEY-----..." }`
+
+### 3.2 Create auth users file
+
+Generate bcrypt hash example:
+
+```bash
+python -c "import bcrypt; print(bcrypt.hashpw(b'alice-pass', bcrypt.gensalt()).decode())"
+```
+
+Create `secrets/auth_users.json`:
+
+```json
+{
+  "alice": {
+    "password_hash": "$2b$12$replace_with_real_hash",
+    "role": "member",
+    "tenant": "default",
+    "scopes": ["conversation:read", "conversation:write"]
+  }
+}
+```
+
+## 4) Preflight validation
+
+```bash
+docker compose config
+```
+
+If this fails, fix `.env` or missing files before continuing.
+
+## 5) Deploy
+
+```bash
+docker compose up -d --build
+```
+
+Check status:
+
+```bash
+docker compose ps
+```
+
+## 6) Post-deploy verification
+
+### 6.1 Health/basic API checks
+
+```bash
+curl -s http://localhost:8000/auth/.well-known/jwks.json
+```
+
+### 6.2 Login and JWT check
+
+```bash
+curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"alice-pass"}'
+```
+
+Use returned `access_token`:
+
+```bash
+curl -s http://localhost:8000/auth/me \
+  -H "Authorization: Bearer <ACCESS_TOKEN>"
+```
+
+### 6.3 Authorization check (scope enforced)
+
+Conversation endpoints require valid JWT and correct scope:
+- `GET /conversation/` -> needs `conversation:read`
+- `GET /conversation/{id}` -> needs `conversation:read`
+- `POST /conversation/{id}` -> needs `conversation:write`
+
+## 7) Logs and audit events
+
+Follow logs:
+
+```bash
+docker compose logs -f app
+```
+
+Security events are written to logger `security.audit` as JSON, including:
+- `login_failed`, `login_succeeded`, `login_rate_limited`
+- `token_issued`, `token_missing`, `token_validation_failed`
+- `refresh_token_rotated`, `refresh_token_reuse`, `refresh_token_inactive`
+- `authorization_denied`
+
+Forward these logs to your central logging/SIEM in production.
+
+## 8) Rolling update
+
+When app code or env changes:
+
+```bash
+docker compose up -d --build
+```
+
+## 9) JWT key rotation (no downtime pattern)
+
+1. Generate new key pair with new `kid`.
+2. Add new key to both key JSON files, keep old key too.
+3. Set `.env` `JWT_ACTIVE_KID` to new `kid`.
+4. Redeploy: `docker compose up -d --build`.
+5. Keep old key for at least `JWT_REFRESH_TOKEN_EXPIRES_DAYS`.
+6. Remove old key and redeploy again.
+
+## 10) Rollback
+
+If deploy fails after key switch:
+1. Restore previous `.env` and key files (including previous `JWT_ACTIVE_KID`).
+2. Redeploy:
+
+```bash
+docker compose up -d --build
+```
+
+3. Verify `/auth/me` and `/conversation/*` authorization paths.
