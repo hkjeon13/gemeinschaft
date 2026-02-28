@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - installed in runtime image
 logger = logging.getLogger(__name__)
 
 _ALLOWED_ROLES = {"user", "assistant", "system"}
+_TITLE_MAX_LENGTH = 120
 
 
 def _now_utc() -> datetime:
@@ -91,6 +92,43 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     normalized["model_display_name"] = str(model_display_name).strip() if model_display_name is not None else None
     normalized["provider"] = str(provider).strip().lower() if provider is not None else None
     return normalized
+
+
+def _normalize_title(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = " ".join(str(value).split()).strip()
+    if not text:
+        return None
+    return text[:_TITLE_MAX_LENGTH]
+
+
+def _title_from_messages(messages: List[Dict[str, Any]]) -> Optional[str]:
+    for item in messages:
+        role = str(item.get("role", "")).strip().lower()
+        if role != "user":
+            continue
+        candidate = _normalize_title(item.get("message"))
+        if candidate:
+            return candidate
+
+    for item in messages:
+        candidate = _normalize_title(item.get("message"))
+        if candidate:
+            return candidate
+    return None
+
+
+def _resolve_conversation_title(conversation: Dict[str, Any]) -> str:
+    explicit = _normalize_title(conversation.get("title"))
+    if explicit:
+        return explicit
+    messages = conversation.get("messages", [])
+    normalized_messages = [_normalized_message(item) for item in messages if isinstance(item, dict)]
+    inferred = _title_from_messages(normalized_messages)
+    if inferred:
+        return inferred
+    return "New conversation"
 
 
 def _truthy(value: str) -> bool:
@@ -164,6 +202,9 @@ class ConversationStoreBackend:
     def hide_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> bool:
         raise NotImplementedError
 
+    def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        raise NotImplementedError
+
     def start_background_tasks(self) -> None:
         return
 
@@ -190,6 +231,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 summaries.append(
                     {
                         "conversation_id": conversation_id,
+                        "title": _resolve_conversation_title(conversation),
                         "message_count": len(conversation["messages"]),
                         "updated_at": conversation["updated_at"],
                     }
@@ -209,6 +251,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 "conversation_id": conversation_id,
                 "tenant_id": tenant_id,
                 "user_id": user_id,
+                "title": _resolve_conversation_title(conversation),
                 "messages": [_normalized_message(item) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
@@ -247,6 +290,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 {
                     "messages": [],
                     "updated_at": now,
+                    "title": None,
                     "visible": True,
                     "hidden_at": None,
                 },
@@ -254,12 +298,15 @@ class InMemoryConversationStore(ConversationStoreBackend):
             conversation["visible"] = True
             conversation["hidden_at"] = None
             conversation["messages"].append(entry)
+            if _normalize_title(conversation.get("title")) is None:
+                conversation["title"] = _title_from_messages(conversation["messages"]) or "New conversation"
             conversation["updated_at"] = now
 
             return {
                 "conversation_id": conversation_id,
                 "tenant_id": tenant_id,
                 "user_id": user_id,
+                "title": _resolve_conversation_title(conversation),
                 "messages": [_normalized_message(item) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
@@ -275,6 +322,20 @@ class InMemoryConversationStore(ConversationStoreBackend):
             conversation["hidden_at"] = _now_iso()
             conversation["updated_at"] = _now_iso()
             return True
+
+    def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        normalized_title = _normalize_title(title)
+        if normalized_title is None:
+            return None
+        with self._lock:
+            tenant_conversations = self._conversations_by_tenant.get(tenant_id, {})
+            user_conversations = tenant_conversations.get(user_id, {})
+            conversation = user_conversations.get(conversation_id)
+            if conversation is None or not bool(conversation.get("visible", True)):
+                return None
+            conversation["title"] = normalized_title
+            conversation["updated_at"] = _now_iso()
+            return normalized_title
 
 
 class PostgresConversationStore(ConversationStoreBackend):
@@ -307,6 +368,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             tenant_id TEXT NOT NULL,
             user_id TEXT NOT NULL,
             conversation_id TEXT NOT NULL,
+            title TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             visible BOOLEAN NOT NULL DEFAULT TRUE,
@@ -314,6 +376,8 @@ class PostgresConversationStore(ConversationStoreBackend):
             PRIMARY KEY (tenant_id, user_id, conversation_id)
         );
 
+        ALTER TABLE conversations
+            ADD COLUMN IF NOT EXISTS title TEXT;
         ALTER TABLE conversations
             ADD COLUMN IF NOT EXISTS visible BOOLEAN NOT NULL DEFAULT TRUE;
         ALTER TABLE conversations
@@ -348,6 +412,35 @@ class PostgresConversationStore(ConversationStoreBackend):
         ALTER TABLE conversation_messages
             ADD COLUMN IF NOT EXISTS provider TEXT;
 
+        UPDATE conversations c
+        SET title = LEFT(
+            COALESCE(
+                NULLIF(TRIM(c.title), ''),
+                (
+                    SELECT m.message
+                    FROM conversation_messages m
+                    WHERE m.tenant_id = c.tenant_id
+                      AND m.user_id = c.user_id
+                      AND m.conversation_id = c.conversation_id
+                      AND m.role = 'user'
+                    ORDER BY m.created_at ASC, m.message_id ASC
+                    LIMIT 1
+                ),
+                (
+                    SELECT m.message
+                    FROM conversation_messages m
+                    WHERE m.tenant_id = c.tenant_id
+                      AND m.user_id = c.user_id
+                      AND m.conversation_id = c.conversation_id
+                    ORDER BY m.created_at ASC, m.message_id ASC
+                    LIMIT 1
+                ),
+                'New conversation'
+            ),
+            120
+        )
+        WHERE c.title IS NULL OR TRIM(c.title) = '';
+
         CREATE INDEX IF NOT EXISTS idx_conversation_messages_lookup
             ON conversation_messages(tenant_id, user_id, conversation_id, created_at ASC, message_id ASC);
         """
@@ -362,14 +455,14 @@ class PostgresConversationStore(ConversationStoreBackend):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT c.conversation_id, COUNT(m.message_id) AS message_count, c.updated_at
+                    SELECT c.conversation_id, c.title, COUNT(m.message_id) AS message_count, c.updated_at
                     FROM conversations c
                     LEFT JOIN conversation_messages m
                       ON c.tenant_id = m.tenant_id
                      AND c.user_id = m.user_id
                      AND c.conversation_id = m.conversation_id
                     WHERE c.tenant_id = %s AND c.user_id = %s AND c.visible = TRUE
-                    GROUP BY c.conversation_id, c.updated_at
+                    GROUP BY c.conversation_id, c.title, c.updated_at
                     ORDER BY c.updated_at DESC
                     """,
                     (tenant_id, user_id),
@@ -380,8 +473,9 @@ class PostgresConversationStore(ConversationStoreBackend):
         return [
             {
                 "conversation_id": row[0],
-                "message_count": int(row[1] or 0),
-                "updated_at": _to_iso(row[2]),
+                "title": _normalize_title(row[1]) or "New conversation",
+                "message_count": int(row[2] or 0),
+                "updated_at": _to_iso(row[3]),
             }
             for row in rows
         ]
@@ -411,20 +505,26 @@ class PostgresConversationStore(ConversationStoreBackend):
         normalized_model_name = str(model_name).strip() if model_name is not None else None
         normalized_model_display_name = str(model_display_name).strip() if model_display_name is not None else None
         normalized_provider = str(provider).strip().lower() if provider is not None else None
+        title_candidate = _normalize_title(message_text) if normalized_role == "user" else None
 
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at, visible, hidden_at)
-                    VALUES (%s, %s, %s, NOW(), TRUE, NULL)
+                    INSERT INTO conversations (tenant_id, user_id, conversation_id, title, updated_at, visible, hidden_at)
+                    VALUES (%s, %s, %s, %s, NOW(), TRUE, NULL)
                     ON CONFLICT (tenant_id, user_id, conversation_id)
                     DO UPDATE SET
                         updated_at = EXCLUDED.updated_at,
                         visible = TRUE,
-                        hidden_at = NULL
+                        hidden_at = NULL,
+                        title = CASE
+                            WHEN conversations.title IS NULL OR TRIM(conversations.title) = ''
+                                THEN COALESCE(EXCLUDED.title, conversations.title)
+                            ELSE conversations.title
+                        END
                     """,
-                    (tenant_id, user_id, conversation_id),
+                    (tenant_id, user_id, conversation_id, title_candidate),
                 )
                 cur.execute(
                     """
@@ -471,20 +571,24 @@ class PostgresConversationStore(ConversationStoreBackend):
         updated_at = _parse_iso_datetime(conversation.get("updated_at"))
         raw_messages = conversation.get("messages", [])
         messages = [item for item in raw_messages if isinstance(item, dict)]
+        normalized_title = _normalize_title(conversation.get("title"))
+        if normalized_title is None:
+            normalized_title = _title_from_messages([_normalized_message(item) for item in messages]) or "New conversation"
 
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    INSERT INTO conversations (tenant_id, user_id, conversation_id, updated_at, visible, hidden_at)
-                    VALUES (%s, %s, %s, %s, TRUE, NULL)
+                    INSERT INTO conversations (tenant_id, user_id, conversation_id, title, updated_at, visible, hidden_at)
+                    VALUES (%s, %s, %s, %s, %s, TRUE, NULL)
                     ON CONFLICT (tenant_id, user_id, conversation_id)
                     DO UPDATE SET
+                        title = EXCLUDED.title,
                         updated_at = EXCLUDED.updated_at,
                         visible = TRUE,
                         hidden_at = NULL
                     """,
-                    (tenant_id, user_id, conversation_id, updated_at),
+                    (tenant_id, user_id, conversation_id, normalized_title, updated_at),
                 )
 
                 cur.execute(
@@ -561,6 +665,27 @@ class PostgresConversationStore(ConversationStoreBackend):
             conn.commit()
         return hidden
 
+    def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        normalized_title = _normalize_title(title)
+        if normalized_title is None:
+            return None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE conversations
+                    SET title = %s, updated_at = NOW()
+                    WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s AND visible = TRUE
+                    RETURNING title
+                    """,
+                    (normalized_title, tenant_id, user_id, conversation_id),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if row is None:
+            return None
+        return _normalize_title(row[0]) or normalized_title
+
     def _fetch_conversation(
         self,
         conn: Any,
@@ -573,7 +698,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             if include_hidden:
                 cur.execute(
                     """
-                    SELECT conversation_id, updated_at
+                    SELECT conversation_id, title, updated_at
                     FROM conversations
                     WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
                     """,
@@ -582,7 +707,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             else:
                 cur.execute(
                     """
-                    SELECT conversation_id, updated_at
+                    SELECT conversation_id, title, updated_at
                     FROM conversations
                     WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s AND visible = TRUE
                     """,
@@ -623,8 +748,9 @@ class PostgresConversationStore(ConversationStoreBackend):
             "conversation_id": header[0],
             "tenant_id": tenant_id,
             "user_id": user_id,
+            "title": _normalize_title(header[1]) or (_title_from_messages(messages) or "New conversation"),
             "messages": messages,
-            "updated_at": _to_iso(header[1]),
+            "updated_at": _to_iso(header[2]),
         }
 
 
@@ -689,6 +815,7 @@ class RedisHotConversationStore:
             "conversation_id": str(conversation.get("conversation_id") or ""),
             "tenant_id": str(conversation.get("tenant_id") or ""),
             "user_id": str(conversation.get("user_id") or ""),
+            "title": _resolve_conversation_title(conversation),
             "messages": normalized_messages,
             "updated_at": str(conversation.get("updated_at") or _now_iso()),
             "_dirty": bool(dirty),
@@ -719,6 +846,7 @@ class RedisHotConversationStore:
             "conversation_id": str(payload.get("conversation_id") or "").strip(),
             "tenant_id": str(payload.get("tenant_id") or "").strip(),
             "user_id": str(payload.get("user_id") or "").strip(),
+            "title": _normalize_title(payload.get("title")),
             "messages": [_normalized_message(item) for item in messages if isinstance(item, dict)],
             "updated_at": str(payload.get("updated_at") or _now_iso()),
             "_dirty": bool(payload.get("_dirty", False)),
@@ -733,6 +861,7 @@ class RedisHotConversationStore:
             "conversation_id": cached["conversation_id"],
             "tenant_id": cached["tenant_id"],
             "user_id": cached["user_id"],
+            "title": _resolve_conversation_title(cached),
             "messages": [_normalized_message(item) for item in cached.get("messages", [])],
             "updated_at": cached["updated_at"],
         }
@@ -758,6 +887,7 @@ class RedisHotConversationStore:
             "conversation_id": conversation_id,
             "tenant_id": tenant_id,
             "user_id": user_id,
+            "title": _resolve_conversation_title(conversation),
             "messages": [_normalized_message(item) for item in conversation.get("messages", []) if isinstance(item, dict)],
             "updated_at": updated_at,
         }
@@ -816,6 +946,7 @@ class RedisHotConversationStore:
             summaries.append(
                 {
                     "conversation_id": cached["conversation_id"],
+                    "title": _resolve_conversation_title(cached),
                     "message_count": len(cached.get("messages", [])),
                     "updated_at": cached["updated_at"],
                 }
@@ -872,12 +1003,30 @@ class RedisHotConversationStore:
             "conversation_id": conversation_id,
             "tenant_id": tenant_id,
             "user_id": user_id,
+            "title": _resolve_conversation_title(
+                {
+                    "title": existing.get("title"),
+                    "messages": existing_messages,
+                }
+            ),
             "messages": existing_messages,
             "updated_at": now_iso,
         }
 
         self.cache_conversation(updated, dirty=True, last_activity_epoch=now_epoch)
         return updated
+
+    def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        normalized_title = _normalize_title(title)
+        if normalized_title is None:
+            return None
+        existing = self.get_conversation(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
+        if existing is None:
+            return None
+        existing["title"] = normalized_title
+        existing["updated_at"] = _now_iso()
+        self.cache_conversation(existing, dirty=True, last_activity_epoch=time.time())
+        return normalized_title
 
     def delete_cached_conversation(self, tenant_id: str, user_id: str, conversation_id: str) -> None:
         client = self._client_or_raise()
@@ -1041,6 +1190,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 continue
             merged[conversation_id] = {
                 "conversation_id": conversation_id,
+                "title": _normalize_title(item.get("title")) or "New conversation",
                 "message_count": int(item.get("message_count", 0) or 0),
                 "updated_at": str(item.get("updated_at") or _now_iso()),
             }
@@ -1051,6 +1201,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 continue
             next_summary = {
                 "conversation_id": conversation_id,
+                "title": _normalize_title(item.get("title")) or "New conversation",
                 "message_count": int(item.get("message_count", 0) or 0),
                 "updated_at": str(item.get("updated_at") or _now_iso()),
             }
@@ -1212,6 +1363,48 @@ class HybridConversationStore(ConversationStoreBackend):
 
         return hidden
 
+    def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        normalized_title = _normalize_title(title)
+        if normalized_title is None:
+            return None
+        self._flush_idle_best_effort()
+
+        if not self._write_through():
+            try:
+                hot = self._hot_store.get_conversation(
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                if hot is not None:
+                    hot["title"] = normalized_title
+                    hot["updated_at"] = _now_iso()
+                    self._cold_store.replace_conversation(hot)
+                    self._hot_store.cache_conversation(hot, dirty=False, last_activity_epoch=time.time())
+                    return normalized_title
+            except Exception:
+                logger.exception("Failed to update title through hot store; falling back to cold store.")
+
+        updated = self._cold_store.update_title(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            title=normalized_title,
+        )
+        if updated is None:
+            return None
+        try:
+            cold = self._cold_store.get_conversation(
+                tenant_id=tenant_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+            )
+            if cold is not None:
+                self._hot_store.cache_conversation(cold, dirty=False, last_activity_epoch=time.time())
+        except Exception:
+            logger.exception("Failed to warm updated conversation title into hot cache.")
+        return updated
+
 
 _memory_store = InMemoryConversationStore()
 _postgres_store = PostgresConversationStore()
@@ -1299,6 +1492,15 @@ class ConversationStore:
             tenant_id=tenant_id,
             user_id=user_id,
             conversation_id=conversation_id,
+        )
+
+    def update_title(self, tenant_id: str, user_id: str, conversation_id: str, title: str) -> Optional[str]:
+        initialize_conversation_store()
+        return _get_store().update_title(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            title=title,
         )
 
 

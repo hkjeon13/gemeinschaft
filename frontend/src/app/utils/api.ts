@@ -244,3 +244,12 @@ export async function hideConversation(conversationId: string) {
     method: 'DELETE',
   });
 }
+
+// 대화 제목 수정
+export async function updateConversationTitle(conversationId: string, title: string) {
+  const encodedId = encodeURIComponent(conversationId);
+  return apiRequest<{ conversation_id: string; title: string }>(`/conversation/${encodedId}/title`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
+}

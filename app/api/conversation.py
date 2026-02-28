@@ -8,6 +8,8 @@ from fastapi.responses import StreamingResponse
 from app.schemas.conversation import (
     ConversationDetailSchema,
     ConversationSummarySchema,
+    ConversationTitleSchema,
+    ConversationTitleUpdateSchema,
     ConversationVisibilitySchema,
     MessageCreateSchema,
     MessageInputSchema,
@@ -270,3 +272,25 @@ async def hide_dialogue(conversation_id: str, access: AccessContext = Depends(re
     if not hidden:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
     return {"conversation_id": conversation_id, "visible": False}
+
+
+@conversation_router.patch("/{conversation_id}/title", response_model=ConversationTitleSchema)
+async def update_dialogue_title(
+    conversation_id: str,
+    payload: ConversationTitleUpdateSchema,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:update", resource_id=conversation_id)
+    normalized = payload.title.strip()
+    if not normalized:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="title must be a non-empty string.")
+    updated = await run_in_threadpool(
+        conversation_store.update_title,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+        title=normalized,
+    )
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    return {"conversation_id": conversation_id, "title": updated}
