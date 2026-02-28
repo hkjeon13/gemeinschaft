@@ -4,64 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Dataset Console</title>
-    <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="layout">
-      <section class="card hero">
-        <p class="eyebrow">dataset.fin-ally.net</p>
-        <h1>Dataset Console</h1>
-        <p class="muted">This page is served on port 10015. API calls are routed through <code>/api/*</code>.</p>
-        <p class="muted">Admin page: <a href="/admin">/admin</a></p>
-      </section>
-
-      <section class="card grid">
-        <div>
-          <h2>1) Login</h2>
-          <form id="login-form" class="stack">
-            <label>
-              Username
-              <input id="username" type="text" value="psyche" required />
-            </label>
-            <label>
-              Password
-              <input id="password" type="password" required />
-            </label>
-            <button type="submit">Sign in</button>
-          </form>
-        </div>
-
-        <div>
-          <h2>2) Token / Profile</h2>
-          <div class="stack">
-            <button id="me-btn" type="button">Load /auth/me</button>
-            <button id="logout-btn" type="button" class="ghost">Clear token</button>
-          </div>
-          <pre id="profile" class="output">Not loaded</pre>
-        </div>
-      </section>
-
-      <section class="card grid">
-        <div>
-          <h2>3) Conversations</h2>
-          <div class="stack inline">
-            <input id="conversation-id" type="text" value="demo-room" />
-            <button id="load-conversation" type="button">Load</button>
-          </div>
-          <div class="stack">
-            <textarea id="message" rows="4" placeholder="Write a message"></textarea>
-            <button id="send-message" type="button">Send message</button>
-            <button id="list-btn" type="button" class="ghost">List conversations</button>
-          </div>
-        </div>
-
-        <div>
-          <h2>Response</h2>
-          <pre id="result" class="output">Ready</pre>
-        </div>
-      </section>
-    </main>
-
-    <script src="/app.js"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

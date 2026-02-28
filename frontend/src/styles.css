@@ -1,11 +1,11 @@
 :root {
-  --bg: #f2f4f8;
+  --bg: #ecf1f7;
   --card: #ffffff;
-  --ink: #0c1a2a;
-  --muted: #45556a;
+  --ink: #0b1b2d;
+  --muted: #42556b;
   --accent: #0f6ab9;
   --accent-strong: #0a4b85;
-  --line: #d5dbe4;
+  --line: #d2dbe6;
   --radius: 16px;
 }
 
@@ -17,7 +17,7 @@ body {
   margin: 0;
   font-family: "IBM Plex Sans", "Noto Sans KR", "Segoe UI", sans-serif;
   color: var(--ink);
-  background: radial-gradient(circle at 10% 10%, #ffffff 0%, var(--bg) 60%);
+  background: radial-gradient(circle at 15% 10%, #ffffff 0%, var(--bg) 55%);
 }
 
 .layout {
@@ -85,7 +85,8 @@ button {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -111,6 +112,10 @@ button.ghost {
   color: #10243b;
 }
 
+a {
+  color: var(--accent);
+}
+
 .output {
   margin: 0;
   border: 1px solid var(--line);
@@ -119,6 +124,63 @@ button.ghost {
   padding: 12px;
   min-height: 220px;
   overflow: auto;
+}
+
+.admin-layout {
+  max-width: 1180px;
+}
+
+.admin-hero {
+  background: linear-gradient(135deg, #ffffff 0%, #eef6ff 45%, #e7fbf4 100%);
+}
+
+.admin-form {
+  max-width: 440px;
+}
+
+.admin-actions-row {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.admin-top-grid {
+  align-items: start;
+}
+
+.admin-table-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 760px;
+  background: #fff;
+}
+
+.users-table thead {
+  background: #f4f8fc;
+}
+
+.users-table th,
+.users-table td {
+  border-bottom: 1px solid #e8edf3;
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: middle;
+  font-size: 14px;
+}
+
+.users-table td button {
+  white-space: nowrap;
 }
 
 @media (max-width: 900px) {
