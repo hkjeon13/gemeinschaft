@@ -13,7 +13,7 @@ from app.services.conversation_store import conversation_store
 conversation_router = APIRouter()
 
 
-@conversation_router.get("/", response_model=List[ConversationSummarySchema])
+@conversation_router.get("/list", response_model=List[ConversationSummarySchema])
 async def conversation_list(access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:list")
     return conversation_store.list_conversations(tenant_id=access.tenant, user_id=access.subject)

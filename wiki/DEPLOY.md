@@ -172,7 +172,7 @@ If you need raw curl checks temporarily, disable DPoP in `.env` for that session
 ### 6.3 Authorization check (scope enforced)
 
 Conversation endpoints require valid JWT and correct scope:
-- `GET /api/conversation/` -> needs `conversation:read`
+- `GET /api/conversation/list` -> needs `conversation:read`
 - `GET /api/conversation/{id}` -> needs `conversation:read`
 - `POST /api/conversation/{id}` -> needs `conversation:write`
 
