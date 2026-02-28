@@ -33,6 +33,9 @@ class MessageSchema(BaseModel):
     role: Literal["user", "assistant", "system"]
     message: str
     created_at: str
+    model_id: Optional[str] = None
+    model_name: Optional[str] = None
+    provider: Optional[str] = None
 
 
 class ConversationSummarySchema(BaseModel):

@@ -75,12 +75,20 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     created_at = entry.get("created_at")
     message = entry.get("message")
     role = entry.get("role", "user")
-    return {
+    model_id = entry.get("model_id")
+    model_name = entry.get("model_name")
+    provider = entry.get("provider")
+
+    normalized = {
         "message_id": str(message_id or ""),
         "role": _normalize_role(str(role)),
         "message": str(message or ""),
         "created_at": str(created_at or _now_iso()),
     }
+    normalized["model_id"] = str(model_id).strip() if model_id is not None else None
+    normalized["model_name"] = str(model_name).strip() if model_name is not None else None
+    normalized["provider"] = str(provider).strip().lower() if provider is not None else None
+    return normalized
 
 
 def _truthy(value: str) -> bool:
@@ -144,6 +152,9 @@ class ConversationStoreBackend:
         conversation_id: str,
         message: str,
         role: str,
+        model_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         raise NotImplementedError
 
@@ -201,6 +212,9 @@ class InMemoryConversationStore(ConversationStoreBackend):
         conversation_id: str,
         message: str,
         role: str,
+        model_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = _now_iso()
         entry = _normalized_message(
@@ -209,6 +223,9 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 "role": role,
                 "message": message,
                 "created_at": now,
+                "model_id": model_id,
+                "model_name": model_name,
+                "provider": provider,
             }
         )
 
@@ -279,11 +296,21 @@ class PostgresConversationStore(ConversationStoreBackend):
             conversation_id TEXT NOT NULL,
             role TEXT NOT NULL,
             message TEXT NOT NULL,
+            model_id TEXT,
+            model_name TEXT,
+            provider TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             FOREIGN KEY (tenant_id, user_id, conversation_id)
                 REFERENCES conversations(tenant_id, user_id, conversation_id)
                 ON DELETE CASCADE
         );
+
+        ALTER TABLE conversation_messages
+            ADD COLUMN IF NOT EXISTS model_id TEXT;
+        ALTER TABLE conversation_messages
+            ADD COLUMN IF NOT EXISTS model_name TEXT;
+        ALTER TABLE conversation_messages
+            ADD COLUMN IF NOT EXISTS provider TEXT;
 
         CREATE INDEX IF NOT EXISTS idx_conversation_messages_lookup
             ON conversation_messages(tenant_id, user_id, conversation_id, created_at ASC, message_id ASC);
@@ -336,10 +363,16 @@ class PostgresConversationStore(ConversationStoreBackend):
         conversation_id: str,
         message: str,
         role: str,
+        model_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         normalized_role = _normalize_role(role)
         message_text = str(message)
         message_id = uuid.uuid4().hex
+        normalized_model_id = str(model_id).strip() if model_id is not None else None
+        normalized_model_name = str(model_name).strip() if model_name is not None else None
+        normalized_provider = str(provider).strip().lower() if provider is not None else None
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -355,11 +388,22 @@ class PostgresConversationStore(ConversationStoreBackend):
                 cur.execute(
                     """
                     INSERT INTO conversation_messages (
-                        message_id, tenant_id, user_id, conversation_id, role, message, created_at
+                        message_id, tenant_id, user_id, conversation_id, role, message,
+                        model_id, model_name, provider, created_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     """,
-                    (message_id, tenant_id, user_id, conversation_id, normalized_role, message_text),
+                    (
+                        message_id,
+                        tenant_id,
+                        user_id,
+                        conversation_id,
+                        normalized_role,
+                        message_text,
+                        normalized_model_id,
+                        normalized_model_name,
+                        normalized_provider,
+                    ),
                 )
 
             payload = self._fetch_conversation(conn, tenant_id, user_id, conversation_id)
@@ -412,14 +456,41 @@ class PostgresConversationStore(ConversationStoreBackend):
                     role = _normalize_role(normalized["role"])
                     message_text = normalized["message"]
                     created_at = _parse_iso_datetime(normalized["created_at"])
+                    model_id = (
+                        str(normalized.get("model_id")).strip()
+                        if normalized.get("model_id") is not None
+                        else None
+                    )
+                    model_name = (
+                        str(normalized.get("model_name")).strip()
+                        if normalized.get("model_name") is not None
+                        else None
+                    )
+                    provider = (
+                        str(normalized.get("provider")).strip().lower()
+                        if normalized.get("provider") is not None
+                        else None
+                    )
 
                     cur.execute(
                         """
                         INSERT INTO conversation_messages (
-                            message_id, tenant_id, user_id, conversation_id, role, message, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            message_id, tenant_id, user_id, conversation_id, role, message,
+                            model_id, model_name, provider, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (message_id, tenant_id, user_id, conversation_id, role, message_text, created_at),
+                        (
+                            message_id,
+                            tenant_id,
+                            user_id,
+                            conversation_id,
+                            role,
+                            message_text,
+                            model_id,
+                            model_name,
+                            provider,
+                            created_at,
+                        ),
                     )
 
             conn.commit()
@@ -446,7 +517,7 @@ class PostgresConversationStore(ConversationStoreBackend):
 
             cur.execute(
                 """
-                SELECT message_id, role, message, created_at
+                SELECT message_id, role, message, model_id, model_name, provider, created_at
                 FROM conversation_messages
                 WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
                 ORDER BY created_at ASC, message_id ASC
@@ -461,7 +532,10 @@ class PostgresConversationStore(ConversationStoreBackend):
                     "message_id": row[0],
                     "role": row[1],
                     "message": row[2],
-                    "created_at": _to_iso(row[3]),
+                    "model_id": row[3],
+                    "model_name": row[4],
+                    "provider": row[5],
+                    "created_at": _to_iso(row[6]),
                 }
             )
             for row in rows
@@ -682,6 +756,9 @@ class RedisHotConversationStore:
         conversation_id: str,
         message: str,
         role: str,
+        model_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         now_iso = _now_iso()
         now_epoch = time.time()
@@ -703,6 +780,9 @@ class RedisHotConversationStore:
                 "role": normalized_role,
                 "message": str(message),
                 "created_at": now_iso,
+                "model_id": model_id,
+                "model_name": model_name,
+                "provider": provider,
             }
         )
 
@@ -955,6 +1035,9 @@ class HybridConversationStore(ConversationStoreBackend):
         conversation_id: str,
         message: str,
         role: str,
+        model_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._flush_idle_best_effort()
 
@@ -965,6 +1048,9 @@ class HybridConversationStore(ConversationStoreBackend):
                 conversation_id=conversation_id,
                 message=message,
                 role=role,
+                model_id=model_id,
+                model_name=model_name,
+                provider=provider,
             )
             try:
                 self._hot_store.cache_conversation(conversation, dirty=False, last_activity_epoch=time.time())
@@ -993,6 +1079,9 @@ class HybridConversationStore(ConversationStoreBackend):
                 conversation_id=conversation_id,
                 message=message,
                 role=role,
+                model_id=model_id,
+                model_name=model_name,
+                provider=provider,
             )
         except Exception:
             logger.exception("Hybrid hot append failed; falling back to cold append.")
@@ -1002,6 +1091,9 @@ class HybridConversationStore(ConversationStoreBackend):
                 conversation_id=conversation_id,
                 message=message,
                 role=role,
+                model_id=model_id,
+                model_name=model_name,
+                provider=provider,
             )
 
 
@@ -1067,6 +1159,9 @@ class ConversationStore:
         conversation_id: str,
         message: str,
         role: str = "user",
+        model_id: Optional[str] = None,
+        model_name: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         initialize_conversation_store()
         return _get_store().append_message(
@@ -1075,6 +1170,9 @@ class ConversationStore:
             conversation_id=conversation_id,
             message=message,
             role=role,
+            model_id=model_id,
+            model_name=model_name,
+            provider=provider,
         )
 
 

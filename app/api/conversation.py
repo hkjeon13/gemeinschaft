@@ -123,6 +123,8 @@ async def _stream_assistant_reply(
     user_id: str,
     conversation_id: str,
     model_id: str,
+    model_name: str,
+    provider: str,
     chat_model: AsyncOpenAIChatModel,
     messages: list[dict[str, str]],
 ) -> AsyncIterator[str]:
@@ -144,8 +146,19 @@ async def _stream_assistant_reply(
             conversation_id=conversation_id,
             message=full_text,
             role="assistant",
+            model_id=model_id,
+            model_name=model_name,
+            provider=provider,
         )
-    yield _sse("done", {"conversation_id": conversation_id, "model_id": model_id})
+    yield _sse(
+        "done",
+        {
+            "conversation_id": conversation_id,
+            "model_id": model_id,
+            "model_name": model_name,
+            "provider": provider,
+        },
+    )
 
 
 @conversation_router.get("/list", response_model=List[ConversationSummarySchema])
@@ -208,6 +221,8 @@ async def create_dialogue(
                 user_id=access.subject,
                 conversation_id=conversation_id,
                 model_id=selected_model.model_id,
+                model_name=selected_model.model,
+                provider=selected_model.provider,
                 chat_model=model_client,
                 messages=messages,
             ),
@@ -230,5 +245,8 @@ async def create_dialogue(
             conversation_id=conversation_id,
             message=assistant_reply,
             role="assistant",
+            model_id=selected_model.model_id,
+            model_name=selected_model.model,
+            provider=selected_model.provider,
         )
     return conversation
