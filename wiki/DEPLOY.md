@@ -29,7 +29,10 @@ import bcrypt
 print(bcrypt.hashpw(b'psyche-pass', bcrypt.gensalt()).decode())
 PY
 
-# 3) auth user file (paste real hash from step 2)
+# 3) Fernet key for model API key encryption
+FERNET_KEY="$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")"
+
+# 4) auth user file (paste real hash from step 2)
 cat > secrets/auth_users.json <<'JSON'
 {
   "psyche": {
@@ -41,12 +44,13 @@ cat > secrets/auth_users.json <<'JSON'
 }
 JSON
 
-# 4) set env values
+# 5) set env values
 sed -i 's/^JWT_ACTIVE_KID=.*/JWT_ACTIVE_KID=k2026_02/' .env
 grep -q '^AUTH_USERS_FILE=' .env || echo 'AUTH_USERS_FILE=/run/secrets/auth_users.json' >> .env
 grep -q '^POSTGRES_PASSWORD=' .env || echo 'POSTGRES_PASSWORD=change-me-now' >> .env
+grep -q '^MODEL_SECRET_ENCRYPTION_KEY=' .env || echo "MODEL_SECRET_ENCRYPTION_KEY=${FERNET_KEY}" >> .env
 
-# 5) validate + deploy
+# 6) validate + deploy
 docker compose config
 docker compose up -d --build
 docker compose ps
@@ -85,6 +89,7 @@ Edit `.env` and set at least:
 - `POSTGRES_PASSWORD` (strong value)
 - `JWT_ACTIVE_KID` (must exist in `secrets/jwt_private_keys.json`)
 - `AUTH_USERS_FILE=/run/secrets/auth_users.json`
+- `MODEL_SECRET_ENCRYPTION_KEY` (required for encrypted `api_key` storage in `/api/admin/models`)
 - `AUTH_COOKIE_SECURE=true` (production HTTPS). For local HTTP testing only, set `AUTH_COOKIE_SECURE=false`.
 - `AUTH_REQUIRE_CSRF=true`
 - `AUTH_REQUIRE_DPOP=true`
@@ -130,6 +135,31 @@ Create `secrets/auth_users.json`:
   }
 }
 ```
+
+### 3.3 Generate model encryption key (Fernet)
+
+If you will store model `api_key` through `/api/admin/models`, set `MODEL_SECRET_ENCRYPTION_KEY`.
+
+Generate on host:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+If host Python is missing `cryptography`, generate via app image:
+
+```bash
+docker compose run --rm app python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Set the generated value in `.env`:
+
+```bash
+echo 'MODEL_SECRET_ENCRYPTION_KEY=<generated_key>' >> .env
+```
+
+Important:
+- Keep this key stable. If you change it later, previously encrypted model `api_key` values in DB cannot be decrypted.
 
 ## 4) Preflight validation
 
