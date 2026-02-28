@@ -258,13 +258,28 @@ docker compose up -d --build
 
 ### 12.1 `version is obsolete` warning
 
+### 12.2 Figma E2E (cross-origin embed)
+
+For Figma-hosted E2E, browser requests are cross-origin. Use these settings:
+
+- `AUTH_COOKIE_SAMESITE=none`
+- `AUTH_COOKIE_SECURE=true`
+- `AUTH_ALLOWED_ORIGINS=*` (temporary non-production)
+- `AUTH_ALLOWED_ORIGIN_REGEX=^https://([a-z0-9-]+\.)?figma\.(site|com)$`
+
+Client notes:
+
+- Send requests with credentials `include`.
+- Keep DPoP keypair stable across page reloads.
+- Use `csrf_token` returned by `/auth/login` and `/auth/refresh` for state-changing requests if cookie read is restricted.
+
 If you see:
 - `the attribute version is obsolete`
 
 It is a Docker Compose v2 warning only. Deployment still works.  
 You can remove top-level `version: "3.9"` from `docker-compose.yml` to silence it.
 
-### 12.2 `AUTH user 'psyche' has invalid bcrypt hash`
+### 12.3 `AUTH user 'psyche' has invalid bcrypt hash`
 
 Cause:
 - `secrets/auth_users.json` contains a non-bcrypt value (example placeholder or broken string).
@@ -279,7 +294,7 @@ docker compose up -d --build app
 docker compose logs -f app
 ```
 
-### 12.3 JWT key parse/validation errors
+### 12.4 JWT key parse/validation errors
 
 Cause:
 - `secrets/jwt_private_keys.json` or `secrets/jwt_public_keys.json` still contains template `...` values.

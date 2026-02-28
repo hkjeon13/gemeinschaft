@@ -38,7 +38,9 @@ Forward these logs to your central logging/SIEM pipeline.
 - CSRF:
   - `AUTH_REQUIRE_CSRF=true`
   - Send `X-CSRF-Token` header equal to `csrf_token` cookie for state-changing requests.
+  - For cross-origin embedded clients (e.g. Figma), use the `csrf_token` returned by `/auth/login` or `/auth/refresh` when cookie reads are restricted.
   - Validate request `Origin` against `AUTH_ALLOWED_ORIGINS` (or same-host fallback).
+  - Optional regex allowlist: `AUTH_ALLOWED_ORIGIN_REGEX`.
 - DPoP:
   - `AUTH_REQUIRE_DPOP=true`
   - Require `DPoP` proof JWT (`ES256`) on login, refresh, logout, and protected API calls.
