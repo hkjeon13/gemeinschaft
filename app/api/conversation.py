@@ -31,6 +31,7 @@ from app.services.chat_model_registry import (
     list_chat_models,
     resolve_chat_model,
 )
+from app.services.conversation_prompt import render_conversation_developer_prompt
 from app.services.conversation_store import conversation_store
 from app.services.conversation_model_list_store import conversation_model_list_store
 from app.services.user_model_preference_store import user_model_preference_store
@@ -234,6 +235,21 @@ def _conversation_to_openai_messages(
         if text:
             converted.append({"role": role, "content": text})
     return converted
+
+
+def _prepend_developer_prompt(
+    messages: list[dict[str, Any]],
+    *,
+    selected_model_id: str,
+    user_id: str,
+) -> list[dict[str, Any]]:
+    prompt = render_conversation_developer_prompt(
+        selected_model_id=selected_model_id,
+        user_id=user_id,
+    )
+    if not prompt:
+        return messages
+    return [{"role": "developer", "content": prompt}, *messages]
 
 
 def _message_input_to_content(item: MessageInputSchema) -> list[dict[str, Any]]:
@@ -673,6 +689,11 @@ async def create_dialogue(
     messages = _conversation_to_openai_messages(
         conversation,
         selected_model_id=selected_model.model_id,
+    )
+    messages = _prepend_developer_prompt(
+        messages,
+        selected_model_id=selected_model.model_id,
+        user_id=access.subject,
     )
     if not messages:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to build chat messages.")

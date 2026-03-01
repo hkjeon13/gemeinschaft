@@ -227,11 +227,12 @@ class AsyncOpenAIChatModel:
     def _normalize_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         has_system = False
+        has_developer = False
         has_user = False
 
         for item in messages:
             role = str(item.get("role", "")).strip().lower()
-            if role not in {"system", "user", "assistant"}:
+            if role not in {"system", "developer", "user", "assistant"}:
                 continue
 
             content_blocks = self._normalize_content_blocks(item.get("content"), role=role)
@@ -240,12 +241,14 @@ class AsyncOpenAIChatModel:
 
             if role == "system":
                 has_system = True
+            if role == "developer":
+                has_developer = True
             if role == "user":
                 has_user = True
 
             normalized.append({"role": role, "content": content_blocks})
 
-        if self.system_prompt and not has_system:
+        if self.system_prompt and not (has_system or has_developer):
             normalized.insert(
                 0,
                 {"role": "system", "content": [{"type": "input_text", "text": self.system_prompt}]},
@@ -347,9 +350,10 @@ class AsyncOpenAIChatModel:
 
     def _message_to_chat_payload(self, item: dict[str, Any]) -> dict[str, Any]:
         role = str(item["role"]).strip().lower()
+        chat_role = "system" if role == "developer" else role
         content = item["content"]
         if not isinstance(content, list):
-            return {"role": role, "content": ""}
+            return {"role": chat_role, "content": ""}
 
         blocks: list[dict[str, Any]] = []
         for block in content:
@@ -368,10 +372,10 @@ class AsyncOpenAIChatModel:
                 blocks.append({"type": "image_url", "image_url": {"url": self._resolve_image_reference(image_url)}})
 
         if not blocks:
-            return {"role": role, "content": ""}
+            return {"role": chat_role, "content": ""}
         if len(blocks) == 1 and blocks[0].get("type") == "text":
-            return {"role": role, "content": str(blocks[0].get("text", ""))}
-        return {"role": role, "content": blocks}
+            return {"role": chat_role, "content": str(blocks[0].get("text", ""))}
+        return {"role": chat_role, "content": blocks}
 
     def _normalize_content_blocks(self, content: Any, *, role: str) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
