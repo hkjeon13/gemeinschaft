@@ -180,6 +180,51 @@ def _select_model_id(
     return random.choice(available_model_ids)
 
 
+def _resolve_continue_model_candidates(
+    *,
+    available_model_ids: list[str],
+    requested_model_id: str | None,
+    requested_model_ids: list[str] | None,
+) -> list[str]:
+    if requested_model_id and requested_model_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use either model_id or model_ids, not both.",
+        )
+
+    if requested_model_id:
+        normalized = requested_model_id.strip()
+        if normalized not in available_model_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Requested model is not configured for this conversation.",
+            )
+        return [normalized]
+
+    requested_candidates = _normalize_model_id_list(requested_model_ids)
+    if requested_candidates:
+        unavailable = [item for item in requested_candidates if item not in available_model_ids]
+        if unavailable:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Requested model_ids are not configured for this conversation: {', '.join(unavailable)}",
+            )
+        return requested_candidates
+
+    return list(available_model_ids)
+
+
+def _ensure_continue_min_participants(model_ids: list[str]) -> None:
+    if len(model_ids) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Continue mode requires at least 2 models in the candidate list. "
+                "Add one more model to this conversation."
+            ),
+        )
+
+
 def _env_float(name: str, default: float) -> float:
     raw = os.getenv(name, str(default)).strip()
     try:
@@ -966,11 +1011,15 @@ async def continue_dialogue(
         user_id=access.subject,
         conversation_id=conversation_id,
     )
-    selected_model_id = _select_model_id(
+    continue_candidates = _resolve_continue_model_candidates(
         available_model_ids=conversation_model_ids,
         requested_model_id=(payload.model_id.strip() if payload.model_id is not None else None),
         requested_model_ids=payload.model_ids,
     )
+    has_explicit_model_selection = payload.model_id is not None or bool(payload.model_ids)
+    if not has_explicit_model_selection:
+        _ensure_continue_min_participants(continue_candidates)
+    selected_model_id = random.choice(continue_candidates)
 
     selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
     if selected_model.provider != "openai":

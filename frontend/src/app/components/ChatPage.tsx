@@ -1087,6 +1087,15 @@ export function ChatPage() {
 
   const handleStartContinue = async (settings: ContinueSettings) => {
     if (!selectedConversationId) return;
+    const candidateModelIds = new Set(
+      (Array.isArray(roomModels) ? roomModels : [])
+        .map((item) => item.model_id)
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    );
+    if (candidateModelIds.size < 2) {
+      alert('연속 대화는 대화방 모델이 최소 2개 이상일 때 시작할 수 있습니다.');
+      return;
+    }
     const convId = selectedConversationId;
     continueRunningRef.current = true;
     setIsContinuing(true);
