@@ -41,6 +41,43 @@ class MessageCreateSchema(BaseModel):
     message: Optional[str] = Field(default=None, min_length=1, max_length=4000)
     messages: Optional[List[MessageInputSchema]] = None
     model_id: Optional[str] = Field(default=None, min_length=1)
+    model_ids: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def validate_model_selection(self):
+        if self.model_id is not None and self.model_ids is not None:
+            raise ValueError("Use either model_id or model_ids, not both.")
+        if self.model_ids is not None:
+            normalized = [str(item).strip() for item in self.model_ids if str(item).strip()]
+            if not normalized:
+                raise ValueError("model_ids must include at least one non-empty model id.")
+            self.model_ids = normalized
+        return self
+
+
+class ConversationContinueSchema(BaseModel):
+    model_id: Optional[str] = Field(default=None, min_length=1)
+    model_ids: Optional[List[str]] = None
+    min_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    max_interval_seconds: Optional[float] = Field(default=None, ge=0)
+    max_turns: Optional[int] = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_options(self):
+        if self.model_id is not None and self.model_ids is not None:
+            raise ValueError("Use either model_id or model_ids, not both.")
+        if self.model_ids is not None:
+            normalized = [str(item).strip() for item in self.model_ids if str(item).strip()]
+            if not normalized:
+                raise ValueError("model_ids must include at least one non-empty model id.")
+            self.model_ids = normalized
+        if (
+            self.min_interval_seconds is not None
+            and self.max_interval_seconds is not None
+            and self.max_interval_seconds < self.min_interval_seconds
+        ):
+            raise ValueError("max_interval_seconds must be greater than or equal to min_interval_seconds.")
+        return self
 
 
 class MessageSchema(BaseModel):

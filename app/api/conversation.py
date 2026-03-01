@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import random
 from typing import Any, AsyncIterator, List
 
@@ -9,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 
 from app.schemas.conversation import (
+    ConversationContinueSchema,
     ConversationDetailSchema,
     ConversationAssignedModelListSchema,
     ConversationAssignedModelSchema,
@@ -103,6 +105,117 @@ def _conversation_model_ids_or_default(tenant_id: str, user_id: str, conversatio
         )
 
     return valid_ids
+
+
+def _normalize_model_id_list(raw_ids: list[str] | None) -> list[str]:
+    if not raw_ids:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_ids:
+        value = str(item).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+    return normalized
+
+
+def _select_model_id(
+    *,
+    available_model_ids: list[str],
+    requested_model_id: str | None,
+    requested_model_ids: list[str] | None,
+) -> str:
+    if requested_model_id and requested_model_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use either model_id or model_ids, not both.",
+        )
+
+    if requested_model_id:
+        normalized = requested_model_id.strip()
+        if normalized not in available_model_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Requested model is not configured for this conversation.",
+            )
+        return normalized
+
+    requested_candidates = _normalize_model_id_list(requested_model_ids)
+    if requested_candidates:
+        unavailable = [item for item in requested_candidates if item not in available_model_ids]
+        if unavailable:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Requested model_ids are not configured for this conversation: {', '.join(unavailable)}",
+            )
+        return random.choice(requested_candidates)
+
+    if not available_model_ids:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="No conversation models are configured.",
+        )
+    return random.choice(available_model_ids)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{name} must be a number.",
+        )
+    if value < 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{name} must be >= 0.",
+        )
+    return value
+
+
+def _resolve_continue_interval_seconds(
+    *,
+    min_interval_seconds: float | None,
+    max_interval_seconds: float | None,
+) -> float:
+    resolved_min = min_interval_seconds
+    resolved_max = max_interval_seconds
+    if resolved_min is None:
+        resolved_min = _env_float("CONVERSATION_CONTINUE_MIN_INTERVAL_SECONDS", 1.0)
+    if resolved_max is None:
+        resolved_max = _env_float("CONVERSATION_CONTINUE_MAX_INTERVAL_SECONDS", 10.0)
+    if resolved_max < resolved_min:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="max_interval_seconds must be greater than or equal to min_interval_seconds.",
+        )
+    if resolved_max == resolved_min:
+        return resolved_min
+    return random.uniform(resolved_min, resolved_max)
+
+
+def _count_assistant_turns(conversation: dict[str, Any], *, user_id: str) -> int:
+    raw_messages = conversation.get("messages", [])
+    if not isinstance(raw_messages, list):
+        return 0
+
+    count = 0
+    for item in raw_messages:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("model_id", "")).strip()
+        if model_id:
+            if model_id != user_id:
+                count += 1
+            continue
+        role = str(item.get("role", "")).strip().lower()
+        if role == "assistant":
+            count += 1
+    return count
 
 
 def _conversation_model_list_response(
@@ -666,17 +779,11 @@ async def create_dialogue(
         conversation_id=conversation_id,
     )
 
-    selected_model_id: str
-    if payload.model_id is not None:
-        requested_model_id = payload.model_id.strip()
-        if requested_model_id not in conversation_model_ids:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Requested model is not configured for this conversation.",
-            )
-        selected_model_id = requested_model_id
-    else:
-        selected_model_id = random.choice(conversation_model_ids)
+    selected_model_id = _select_model_id(
+        available_model_ids=conversation_model_ids,
+        requested_model_id=(payload.model_id.strip() if payload.model_id is not None else None),
+        requested_model_ids=payload.model_ids,
+    )
 
     selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
     if selected_model.provider != "openai":
@@ -748,6 +855,132 @@ async def create_dialogue(
         )
     except asyncio.CancelledError:
         # Request ended early; detached generation continues and persists reply.
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate assistant response: {exc}",
+        )
+
+    if generated_conversation is not None:
+        return generated_conversation
+    return conversation
+
+
+@conversation_router.post("/{conversation_id}/continue", response_model=ConversationDetailSchema)
+async def continue_dialogue(
+    conversation_id: str,
+    payload: ConversationContinueSchema,
+    stream: bool = Query(default=False),
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:create", resource_id=conversation_id)
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    if not isinstance(conversation.get("messages"), list) or not conversation.get("messages"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Conversation has no messages to continue from.")
+    if payload.max_turns is not None:
+        current_turns = _count_assistant_turns(conversation, user_id=access.subject)
+        if current_turns >= payload.max_turns:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"max_turns reached ({payload.max_turns}).",
+            )
+
+    conversation_model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+    )
+    selected_model_id = _select_model_id(
+        available_model_ids=conversation_model_ids,
+        requested_model_id=(payload.model_id.strip() if payload.model_id is not None else None),
+        requested_model_ids=payload.model_ids,
+    )
+
+    selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
+    if selected_model.provider != "openai":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported provider: {selected_model.provider}",
+        )
+    model_client = _chat_model(selected_model)
+
+    messages = _conversation_to_openai_messages(
+        conversation,
+        selected_model_id=selected_model.model_id,
+    )
+    messages = _prepend_developer_prompt(
+        messages,
+        selected_model_id=selected_model.model_id,
+        user_id=access.subject,
+    )
+    if not messages:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to build chat messages.")
+
+    delay_seconds = _resolve_continue_interval_seconds(
+        min_interval_seconds=payload.min_interval_seconds,
+        max_interval_seconds=payload.max_interval_seconds,
+    )
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+
+    if stream:
+        event_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=_STREAM_EVENT_QUEUE_MAXSIZE)
+        stream_task = asyncio.create_task(
+            _stream_assistant_reply_task(
+                tenant_id=access.tenant,
+                user_id=access.subject,
+                conversation_id=conversation_id,
+                model_id=selected_model.model_id,
+                model_name=selected_model.model,
+                model_display_name=selected_model.display_name,
+                provider=selected_model.provider,
+                chat_model=model_client,
+                messages=messages,
+                event_queue=event_queue,
+            )
+        )
+        stream_task.add_done_callback(_log_background_task_result)
+        return StreamingResponse(
+            _stream_assistant_reply(
+                tenant_id=access.tenant,
+                user_id=access.subject,
+                event_queue=event_queue,
+            ),
+            media_type="text/event-stream",
+        )
+
+    generation_task = asyncio.create_task(
+        _generate_assistant_reply(
+            tenant_id=access.tenant,
+            user_id=access.subject,
+            conversation_id=conversation_id,
+            model_id=selected_model.model_id,
+            model_name=selected_model.model,
+            model_display_name=selected_model.display_name,
+            provider=selected_model.provider,
+            chat_model=model_client,
+            messages=messages,
+        )
+    )
+    generation_task.add_done_callback(_log_background_task_result)
+
+    try:
+        generated_conversation = await asyncio.shield(generation_task)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+    except asyncio.CancelledError:
         raise
     except Exception as exc:
         raise HTTPException(
