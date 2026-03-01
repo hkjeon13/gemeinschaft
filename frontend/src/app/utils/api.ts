@@ -143,7 +143,10 @@ export async function apiRequest<T>(
         console.log('[API] Added CSRF token:', csrfToken.substring(0, 20) + '...');
       }
     } else {
-      console.warn('[API] CSRF token not found in cookies');
+      // 로그인 요청이 아닌 경우에만 경고 표시
+      if (!endpoint.includes('/auth/login')) {
+        console.warn('[API] CSRF token not found - will be obtained from response');
+      }
     }
   }
 
@@ -184,6 +187,11 @@ export async function apiRequest<T>(
       const errorText = await response.text();
       console.error(`[API] Error response:`, errorText);
       throw new Error(`API Error ${response.status}: ${errorText}`);
+    }
+
+    // 204 No Content 응답 처리 (DELETE 등)
+    if (response.status === 204) {
+      return null as T;
     }
 
     const data = await response.json();
@@ -237,19 +245,246 @@ export async function logout() {
   });
 }
 
-// 대화 숨김(소프트 삭제)
-export async function hideConversation(conversationId: string) {
-  const encodedId = encodeURIComponent(conversationId);
-  return apiRequest<{ conversation_id: string; visible: boolean }>(`/conversation/${encodedId}`, {
-    method: 'DELETE',
-  });
+// 대화 목록 조회
+export async function getConversationList() {
+  return apiRequest<Array<{
+    conversation_id: string;
+    title?: string;
+    message_count: number;
+    updated_at: string;
+    has_unread?: boolean;
+  }>>('/conversation/list');
 }
 
 // 대화 제목 수정
 export async function updateConversationTitle(conversationId: string, title: string) {
-  const encodedId = encodeURIComponent(conversationId);
-  return apiRequest<{ conversation_id: string; title: string }>(`/conversation/${encodedId}/title`, {
+  return apiRequest<{ conversation_id: string; title: string }>(
+    `/conversation/${conversationId}/title`,
+    { method: 'PATCH', body: JSON.stringify({ title }) }
+  );
+}
+
+// ─── 대화 모델 ────────────────────────────────────────────────────────────────
+
+export interface ConversationModelOption {
+  model_id: string;
+  provider: string;
+  openai_api: string;
+  model: string;
+  display_name: string;
+  description?: string;
+  is_global_default: boolean;
+  is_user_default: boolean;
+}
+
+export async function getConversationModelList() {
+  return apiRequest<ConversationModelOption[]>('/conversation/model/list');
+}
+
+export async function getConversationDefaultModel() {
+  return apiRequest<{ model_id: string; display_name: string; source: string }>('/conversation/model/default');
+}
+
+export async function setConversationDefaultModel(model_id: string) {
+  return apiRequest<void>('/conversation/model/default', {
+    method: 'PUT',
+    body: JSON.stringify({ model_id }),
+  });
+}
+
+export async function deleteConversationDefaultModel() {
+  return apiRequest<{ model_id: string; display_name: string; source: string }>('/conversation/model/default', {
+    method: 'DELETE',
+  });
+}
+
+// 대화 상세 조회
+export async function getConversation(conversationId: string) {
+  return apiRequest<{
+    conversation_id: string;
+    tenant_id: string;
+    user_id: string;
+    messages: Array<{
+      message_id: string;
+      message: string;
+      created_at: string;
+    }>;
+    updated_at: string;
+  }>(`/conversation/${conversationId}`);
+}
+
+// 메시지 추가
+export async function addMessage(conversationId: string, message: string, modelId?: string) {
+  return apiRequest<{
+    conversation_id: string;
+    tenant_id: string;
+    user_id: string;
+    messages: Array<{
+      message_id: string;
+      message: string;
+      created_at: string;
+    }>;
+    updated_at: string;
+  }>(`/conversation/${conversationId}`, {
+    method: 'POST',
+    body: JSON.stringify({
+      messages: [{ role: 'user', content: [{ type: 'text', text: message }] }],
+      ...(modelId ? { model_id: modelId } : {}),
+    }),
+  });
+}
+
+// ─── 대화방 모델 리스트 ──────────────────────────────────────────────────────
+
+export interface ConversationRoomModel {
+  model_id: string;
+  display_name: string;
+  model: string;
+  provider: string;
+  openai_api?: string;
+}
+
+/** 대화방에 설정된 모델 리스트 조회 (없으면 사용자 기본 모델 1개로 자동 초기화) */
+export async function getConversationRoomModels(conversationId: string) {
+  const res = await apiRequest<{ conversation_id: string; models: ConversationRoomModel[] }>(
+    `/conversation/${conversationId}/models`
+  );
+  return res.models ?? [];
+}
+
+/** 대화방에 모델 추가 */
+export async function addConversationRoomModel(conversationId: string, modelId: string) {
+  const res = await apiRequest<{ conversation_id: string; models: ConversationRoomModel[] }>(
+    `/conversation/${conversationId}/models`,
+    { method: 'POST', body: JSON.stringify({ model_id: modelId }) }
+  );
+  return res.models ?? [];
+}
+
+/** 대화방에서 모델 제거 (마지막 1개는 400) */
+export async function removeConversationRoomModel(conversationId: string, modelId: string) {
+  const res = await apiRequest<{ conversation_id: string; models: ConversationRoomModel[] }>(
+    `/conversation/${conversationId}/models/${modelId}`,
+    { method: 'DELETE' }
+  );
+  return res.models ?? [];
+}
+
+// 모델 목록 조회
+export async function getModels() {
+  return apiRequest<Array<{
+    model_id: string;
+    provider: string;
+    openai_api: 'chat.completions' | 'responses';
+    model: string;
+    display_name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+    client_options: Record<string, unknown>;
+    chat_create_options: Record<string, unknown>;
+    responses_create_options: Record<string, unknown>;
+    has_api_key: boolean;
+    has_webhook_secret: boolean;
+    is_active: boolean;
+    is_default: boolean;
+    created_at: string;
+    updated_at: string;
+  }>>('/admin/models');
+}
+
+// 모델 등록
+export async function createModel(data: {
+  model_id?: string;
+  provider?: string;
+  openai_api?: 'chat.completions' | 'responses';
+  model: string;
+  display_name?: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+  client_options?: Record<string, unknown>;
+  chat_create_options?: Record<string, unknown>;
+  responses_create_options?: Record<string, unknown>;
+  api_key?: string;
+  webhook_secret?: string;
+  is_active?: boolean;
+  is_default?: boolean;
+}) {
+  return apiRequest('/admin/models', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+// 모델 수정
+export async function updateModel(
+  modelId: string,
+  data: {
+    provider?: string;
+    openai_api?: 'chat.completions' | 'responses';
+    model?: string;
+    display_name?: string;
+    description?: string;
+    parameters?: Record<string, unknown>;
+    client_options?: Record<string, unknown>;
+    chat_create_options?: Record<string, unknown>;
+    responses_create_options?: Record<string, unknown>;
+    api_key?: string;
+    webhook_secret?: string;
+    clear_api_key?: boolean;
+    clear_webhook_secret?: boolean;
+    is_active?: boolean;
+    is_default?: boolean;
+  }
+) {
+  return apiRequest(`/admin/models/${modelId}`, {
     method: 'PATCH',
-    body: JSON.stringify({ title }),
+    body: JSON.stringify(data),
+  });
+}
+
+// 모델 삭제
+export async function deleteModel(modelId: string) {
+  return apiRequest(`/admin/models/${modelId}`, {
+    method: 'DELETE',
+  });
+}
+
+// 대화 숨기기 (소프트 삭제)
+export async function hideConversation(conversationId: string) {
+  return apiRequest<{ conversation_id: string; visible: boolean }>(
+    `/conversation/${conversationId}`,
+    { method: 'DELETE' }
+  );
+}
+
+// 연속 대화 (입력 없이 이어서 답변)
+export async function continueConversation(
+  conversationId: string,
+  options: {
+    model_id?: string;
+    model_ids?: string[];
+    min_interval_seconds?: number;
+    max_interval_seconds?: number;
+    max_turns?: number;
+  } = {}
+) {
+  return apiRequest<{
+    conversation_id: string;
+    tenant_id: string;
+    user_id: string;
+    messages: Array<{
+      message_id: string;
+      message: string;
+      role?: string;
+      model_id?: string;
+      model_name?: string;
+      model_display_name?: string;
+      provider?: string;
+      created_at: string;
+    }>;
+    updated_at: string;
+  }>(`/conversation/${conversationId}/continue`, {
+    method: 'POST',
+    body: JSON.stringify(options),
   });
 }

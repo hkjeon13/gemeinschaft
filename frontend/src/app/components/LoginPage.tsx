@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router";
 import { login } from '../utils/api';
 
 export function LoginPage() {
@@ -98,7 +98,7 @@ export function LoginPage() {
         </form>
 
         <div className="mt-4 text-center text-xs text-gray-500">
-          <p>테스트 계정: psyche / psyche-pass</p>
+          
         </div>
       </div>
     </div>

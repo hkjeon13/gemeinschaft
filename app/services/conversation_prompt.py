@@ -116,11 +116,18 @@ def get_conversation_developer_prompt_template() -> str:
     return loaded
 
 
-def render_conversation_developer_prompt(*, selected_model_id: str, user_id: str) -> str:
+def render_conversation_developer_prompt(
+    *,
+    selected_model_id: str,
+    selected_model_display_name: str | None = None,
+    user_id: str,
+) -> str:
     template = get_conversation_developer_prompt_template()
+    resolved_display_name = str(selected_model_display_name or "").strip() or selected_model_id
     try:
         rendered = template.format(
             selected_model_id=selected_model_id,
+            selected_model_display_name=resolved_display_name,
             user_id=user_id,
         )
     except Exception:

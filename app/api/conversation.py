@@ -374,10 +374,12 @@ def _prepend_developer_prompt(
     messages: list[dict[str, Any]],
     *,
     selected_model_id: str,
+    selected_model_display_name: str,
     user_id: str,
 ) -> list[dict[str, Any]]:
     prompt = render_conversation_developer_prompt(
         selected_model_id=selected_model_id,
+        selected_model_display_name=selected_model_display_name,
         user_id=user_id,
     )
     if not prompt:
@@ -864,6 +866,7 @@ async def create_dialogue(
     messages = _prepend_developer_prompt(
         messages,
         selected_model_id=selected_model.model_id,
+        selected_model_display_name=selected_model.display_name,
         user_id=access.subject,
     )
     if not messages:
@@ -984,6 +987,7 @@ async def continue_dialogue(
     messages = _prepend_developer_prompt(
         messages,
         selected_model_id=selected_model.model_id,
+        selected_model_display_name=selected_model.display_name,
         user_id=access.subject,
     )
     if not messages:
