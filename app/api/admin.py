@@ -1,3 +1,5 @@
+import random
+import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -21,11 +23,77 @@ from app.services.auth import (
 from app.services.chat_model_registry import (
     create_chat_model,
     delete_chat_model,
+    get_chat_model,
     list_chat_models,
     update_chat_model,
 )
 
 admin_router = APIRouter()
+_RNG = random.SystemRandom()
+_MODEL_ID_WORDS_A = (
+    "amber",
+    "apex",
+    "arctic",
+    "bold",
+    "brisk",
+    "calm",
+    "clear",
+    "cobalt",
+    "crisp",
+    "delta",
+    "ember",
+    "frost",
+    "gloss",
+    "lunar",
+    "mist",
+    "nova",
+    "opal",
+    "prism",
+    "rapid",
+    "sage",
+    "solar",
+    "swift",
+    "tidal",
+    "vivid",
+)
+_MODEL_ID_WORDS_B = (
+    "anchor",
+    "bridge",
+    "cipher",
+    "comet",
+    "drift",
+    "engine",
+    "falcon",
+    "field",
+    "forge",
+    "garden",
+    "harbor",
+    "horizon",
+    "matrix",
+    "orbit",
+    "path",
+    "peak",
+    "quest",
+    "ridge",
+    "signal",
+    "spark",
+    "stream",
+    "vector",
+    "voyage",
+    "wave",
+)
+
+
+def _generate_model_id() -> str:
+    for _ in range(96):
+        candidate = f"{_RNG.choice(_MODEL_ID_WORDS_A)}-{_RNG.choice(_MODEL_ID_WORDS_B)}-{_RNG.randint(100, 999)}"
+        if get_chat_model(candidate) is None:
+            return candidate
+
+    while True:
+        fallback = f"model-{uuid.uuid4().hex[:10]}"
+        if get_chat_model(fallback) is None:
+            return fallback
 
 
 def _model_schema(item) -> AdminChatModelSchema:
@@ -131,8 +199,9 @@ async def admin_list_models(access: AccessContext = Depends(require_access_conte
 @admin_router.post("/models", response_model=AdminChatModelSchema, status_code=status.HTTP_201_CREATED)
 async def admin_create_model(payload: AdminChatModelCreateSchema, access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="admin:model:create")
+    model_id = payload.model_id.strip() if payload.model_id else _generate_model_id()
     created = create_chat_model(
-        model_id=payload.model_id,
+        model_id=model_id,
         provider=payload.provider,
         openai_api=payload.openai_api,
         model=payload.model,
