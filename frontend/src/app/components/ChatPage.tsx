@@ -843,18 +843,24 @@ function ConversationHeader({
                       </button>
                     ) : (
                       <button
-                        disabled={isNewConversation}
+                        disabled={isNewConversation || safeRoomModels.length < 2}
                         className={`w-full text-left px-3.5 py-2 text-sm flex items-center gap-2.5 transition-colors ${
-                          isNewConversation
+                          isNewConversation || safeRoomModels.length < 2
                             ? 'text-gray-300 cursor-not-allowed'
                             : 'text-gray-700 hover:bg-gray-50 cursor-pointer'
                         }`}
-                        onClick={() => { if (!isNewConversation) { setMenuOpen(false); onOpenContinueSettings(); } }}
-                        title={isNewConversation ? '메시지를 보낸 후 사용할 수 있습니다' : undefined}
+                        onClick={() => { if (!isNewConversation && safeRoomModels.length >= 2) { setMenuOpen(false); onOpenContinueSettings(); } }}
+                        title={
+                          isNewConversation
+                            ? '메시지를 보낸 후 사용할 수 있습니다'
+                            : safeRoomModels.length < 2
+                              ? '모델을 2개 이상 추가해야 연속 대화를 시작할 수 있습니다'
+                              : undefined
+                        }
                       >
                         <svg viewBox="0 0 16 16" fill="none" className="w-3.5 h-3.5 flex-shrink-0">
-                          <circle cx="8" cy="8" r="6.5" stroke={isNewConversation ? '#d1d5db' : '#9ca3af'} strokeWidth="1.5" />
-                          <path d="M6.5 5.5l4 2.5-4 2.5V5.5Z" fill={isNewConversation ? '#d1d5db' : '#9ca3af'} />
+                          <circle cx="8" cy="8" r="6.5" stroke={isNewConversation || safeRoomModels.length < 2 ? '#d1d5db' : '#9ca3af'} strokeWidth="1.5" />
+                          <path d="M6.5 5.5l4 2.5-4 2.5V5.5Z" fill={isNewConversation || safeRoomModels.length < 2 ? '#d1d5db' : '#9ca3af'} />
                         </svg>
                         연속 대화
                       </button>
@@ -1087,15 +1093,6 @@ export function ChatPage() {
 
   const handleStartContinue = async (settings: ContinueSettings) => {
     if (!selectedConversationId) return;
-    const candidateModelIds = new Set(
-      (Array.isArray(roomModels) ? roomModels : [])
-        .map((item) => item.model_id)
-        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-    );
-    if (candidateModelIds.size < 2) {
-      alert('연속 대화는 대화방 모델이 최소 2개 이상일 때 시작할 수 있습니다.');
-      return;
-    }
     const convId = selectedConversationId;
     continueRunningRef.current = true;
     setIsContinuing(true);
@@ -1165,7 +1162,7 @@ export function ChatPage() {
         <div className="px-4 pt-5 pb-3">
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
-              
+
               <span className="text-sm font-semibold text-gray-800">Gemeinschaft</span>
             </div>
           </div>
