@@ -43,6 +43,26 @@ logger = logging.getLogger(__name__)
 _STREAM_EVENT_QUEUE_MAXSIZE = 256
 _TEXT_CONTENT_TYPES = {"text", "input_text", "output_text"}
 _IMAGE_CONTENT_TYPES = {"image_url", "input_image", "output_image"}
+_GREETING_LOOP_MARKERS = (
+    "안녕",
+    "반가",
+    "도와드릴까요",
+    "도와줄까요",
+    "도움이 필요",
+    "무엇을 도와",
+    "how can i help",
+    "how may i assist",
+    "what can i help",
+    "nice to meet",
+    "glad to meet",
+)
+_TOPIC_SHIFT_SUGGESTIONS = (
+    "오늘 식사/간식",
+    "주말 계획",
+    "요즘 즐겨보는 콘텐츠",
+    "최근 날씨와 컨디션",
+    "요즘 하고 있는 취미",
+)
 
 
 def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
@@ -362,7 +382,51 @@ def _prepend_developer_prompt(
     )
     if not prompt:
         return messages
+    if _needs_topic_shift(messages):
+        topic = random.choice(_TOPIC_SHIFT_SUGGESTIONS)
+        prompt = (
+            f"{prompt}\n\n"
+            "Additional directive for this turn: recent turns are stuck in repetitive greeting/help-offer patterns. "
+            "Do not greet again. Move the conversation forward naturally with a concrete small-talk pivot. "
+            f"Suggested pivot topic: {topic}. "
+            "Use one short statement + one specific follow-up question."
+        )
     return [{"role": "developer", "content": prompt}, *messages]
+
+
+def _extract_text_from_openai_message(item: dict[str, Any]) -> str:
+    content = item.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = str(block.get("text", "")).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
+def _is_greeting_like(text: str) -> bool:
+    lowered = text.strip().lower()
+    if not lowered:
+        return False
+    return any(marker in lowered for marker in _GREETING_LOOP_MARKERS)
+
+
+def _needs_topic_shift(messages: list[dict[str, Any]]) -> bool:
+    if not messages:
+        return False
+    recent = messages[-4:]
+    recent_texts = [_extract_text_from_openai_message(item) for item in recent]
+    greeting_like_count = sum(1 for text in recent_texts if _is_greeting_like(text))
+    if greeting_like_count < 2:
+        return False
+    # When most recent turns are greeting-like, force a pivot.
+    return greeting_like_count >= max(2, len([text for text in recent_texts if text]) - 1)
 
 
 def _message_input_to_content(item: MessageInputSchema) -> list[dict[str, Any]]:
