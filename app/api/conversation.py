@@ -38,6 +38,8 @@ from app.services.user_model_preference_store import user_model_preference_store
 conversation_router = APIRouter()
 logger = logging.getLogger(__name__)
 _STREAM_EVENT_QUEUE_MAXSIZE = 256
+_TEXT_CONTENT_TYPES = {"text", "input_text", "output_text"}
+_IMAGE_CONTENT_TYPES = {"image_url", "input_image", "output_image"}
 
 
 def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
@@ -162,59 +164,114 @@ def _chat_model(selected: ResolvedChatModel) -> AsyncOpenAIChatModel:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
 
-def _conversation_to_openai_messages(conversation: dict[str, Any], max_messages: int = 20) -> list[dict[str, str]]:
+def _normalize_content_blocks(content: Any) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        block_type = str(item.get("type", "")).strip().lower()
+        if not block_type:
+            continue
+        if block_type in _TEXT_CONTENT_TYPES:
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            normalized.append({"type": "input_text" if block_type == "text" else block_type, "text": text})
+            continue
+        if block_type in _IMAGE_CONTENT_TYPES:
+            image_url = str(item.get("image_url", "")).strip()
+            if not image_url:
+                continue
+            normalized.append({"type": "input_image" if block_type == "image_url" else block_type, "image_url": image_url})
+    return normalized
+
+
+def _content_to_preview_text(content: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for block in content:
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type not in _TEXT_CONTENT_TYPES:
+            continue
+        text = str(block.get("text", "")).strip()
+        if text:
+            parts.append(text)
+    if parts:
+        return "\n".join(parts).strip()
+    for block in content:
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type in _IMAGE_CONTENT_TYPES:
+            image_url = str(block.get("image_url", "")).strip()
+            if image_url:
+                return "[image]"
+    return ""
+
+
+def _conversation_to_openai_messages(conversation: dict[str, Any], max_messages: int = 20) -> list[dict[str, Any]]:
     messages = conversation.get("messages", [])
     if not isinstance(messages, list):
         return []
 
     recent = messages[-max_messages:]
-    converted: list[dict[str, str]] = []
+    converted: list[dict[str, Any]] = []
     for item in recent:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role", "user")).strip().lower()
-        content = str(item.get("message", "")).strip()
         if role not in {"user", "assistant", "system"}:
             role = "user"
-        if not content:
+        content_blocks = _normalize_content_blocks(item.get("content"))
+        if content_blocks:
+            converted.append({"role": role, "content": content_blocks})
             continue
-        converted.append({"role": role, "content": content})
+
+        text = str(item.get("message", "")).strip()
+        if text:
+            converted.append({"role": role, "content": text})
     return converted
 
 
-def _message_input_to_text(item: MessageInputSchema) -> str:
-    pieces: list[str] = []
+def _message_input_to_content(item: MessageInputSchema) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
     for part in item.content:
-        if part.type != "text":
+        block_type = str(part.type).strip().lower()
+        if block_type in _TEXT_CONTENT_TYPES:
+            text = (part.text or "").strip()
+            if not text:
+                continue
+            blocks.append({"type": "input_text" if block_type == "text" else block_type, "text": text})
             continue
-        text = part.text.strip()
-        if text:
-            pieces.append(text)
-    return "\n".join(pieces).strip()
+        if block_type in _IMAGE_CONTENT_TYPES:
+            image_url = (part.image_url or "").strip()
+            if not image_url:
+                continue
+            blocks.append({"type": "input_image" if block_type == "image_url" else block_type, "image_url": image_url})
+    return blocks
 
 
-def _resolve_user_input(payload: MessageCreateSchema) -> str:
+def _resolve_user_input(payload: MessageCreateSchema) -> tuple[str, list[dict[str, Any]]]:
     if payload.messages:
         for item in reversed(payload.messages):
             if item.role != "user":
                 continue
-            text = _message_input_to_text(item)
-            if text:
-                return text
+            blocks = _message_input_to_content(item)
+            if blocks:
+                return _content_to_preview_text(blocks), blocks
 
         for item in reversed(payload.messages):
-            text = _message_input_to_text(item)
-            if text:
-                return text
+            blocks = _message_input_to_content(item)
+            if blocks:
+                return _content_to_preview_text(blocks), blocks
 
     if payload.message:
         text = payload.message.strip()
         if text:
-            return text
+            return text, [{"type": "input_text", "text": text}]
 
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
-        detail="A non-empty user text is required in `messages[].content[].text` or `message`.",
+        detail="At least one content block is required in `messages[].content[]` or `message`.",
     )
 
 
@@ -264,6 +321,7 @@ async def _append_assistant_message(
     text = message.strip()
     if not text:
         return None
+    content = [{"type": "output_text", "text": text}]
     return await run_in_threadpool(
         conversation_store.append_message,
         tenant_id=tenant_id,
@@ -271,6 +329,7 @@ async def _append_assistant_message(
         conversation_id=conversation_id,
         message=text,
         role="assistant",
+        content=content,
         model_id=model_id,
         model_name=model_name,
         model_display_name=model_display_name,
@@ -288,7 +347,7 @@ async def _generate_assistant_reply(
     model_display_name: str,
     provider: str,
     chat_model: AsyncOpenAIChatModel,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     assistant_reply = await chat_model.generate_messages(messages)
     return await _append_assistant_message(
@@ -313,7 +372,7 @@ async def _stream_assistant_reply_task(
     model_display_name: str,
     provider: str,
     chat_model: AsyncOpenAIChatModel,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     event_queue: asyncio.Queue[tuple[str, dict[str, Any]]],
 ) -> None:
     chunks: list[str] = []
@@ -570,7 +629,7 @@ async def create_dialogue(
     access: AccessContext = Depends(require_access_context),
 ):
     authorize_action(access, action="conversation:create", resource_id=conversation_id)
-    user_message = _resolve_user_input(payload)
+    user_message, user_content = _resolve_user_input(payload)
     conversation = await run_in_threadpool(
         conversation_store.append_message,
         tenant_id=access.tenant,
@@ -578,6 +637,7 @@ async def create_dialogue(
         conversation_id=conversation_id,
         message=user_message,
         role="user",
+        content=user_content,
     )
     conversation_model_ids = await run_in_threadpool(
         _conversation_model_ids_or_default,
@@ -653,6 +713,11 @@ async def create_dialogue(
 
     try:
         generated_conversation = await asyncio.shield(generation_task)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
     except asyncio.CancelledError:
         # Request ended early; detached generation continues and persists reply.
         raise

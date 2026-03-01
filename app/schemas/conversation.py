@@ -1,11 +1,26 @@
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class MessageContentInputSchema(BaseModel):
-    type: Literal["text"] = "text"
-    text: str = Field(..., min_length=1)
+    type: Literal["text", "input_text", "output_text", "image_url", "input_image", "output_image"]
+    text: Optional[str] = Field(default=None, min_length=1)
+    image_url: Optional[str] = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        block_type = self.type
+        text = self.text
+        image_url = self.image_url
+
+        if block_type in {"text", "input_text", "output_text"}:
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("text is required for text content blocks.")
+        elif block_type in {"image_url", "input_image", "output_image"}:
+            if not isinstance(image_url, str) or not image_url.strip():
+                raise ValueError("image_url is required for image content blocks.")
+        return self
 
 
 class MessageSpeakerInputSchema(BaseModel):
@@ -32,6 +47,7 @@ class MessageSchema(BaseModel):
     message_id: str
     role: Literal["user", "assistant", "system"]
     message: str
+    content: List[MessageContentInputSchema] = Field(default_factory=list)
     created_at: str
     model_id: Optional[str] = None
     model_name: Optional[str] = None

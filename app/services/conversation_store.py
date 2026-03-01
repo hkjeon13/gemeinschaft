@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_ROLES = {"user", "assistant", "system"}
 _TITLE_MAX_LENGTH = 120
+_TEXT_CONTENT_TYPES = {"text", "input_text", "output_text"}
+_IMAGE_CONTENT_TYPES = {"image_url", "input_image", "output_image"}
 
 
 def _now_utc() -> datetime:
@@ -80,11 +82,20 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     model_name = entry.get("model_name")
     model_display_name = entry.get("model_display_name")
     provider = entry.get("provider")
+    content = entry.get("content")
+
+    normalized_content = _normalize_content_blocks(content)
+    if not normalized_content:
+        normalized_content = _content_from_legacy_message(role=str(role), message=message)
+    message_text = _text_from_content(normalized_content)
+    if not message_text and isinstance(message, str) and message.strip():
+        message_text = message.strip()
 
     normalized = {
         "message_id": str(message_id or ""),
         "role": _normalize_role(str(role)),
-        "message": str(message or ""),
+        "message": message_text,
+        "content": normalized_content,
         "created_at": str(created_at or _now_iso()),
     }
     normalized["model_id"] = str(model_id).strip() if model_id is not None else None
@@ -92,6 +103,59 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     normalized["model_display_name"] = str(model_display_name).strip() if model_display_name is not None else None
     normalized["provider"] = str(provider).strip().lower() if provider is not None else None
     return normalized
+
+
+def _normalize_content_blocks(content: Any) -> List[Dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        block_type = str(item.get("type", "")).strip().lower()
+        if not block_type:
+            continue
+
+        if block_type in _TEXT_CONTENT_TYPES:
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            normalized.append({"type": "input_text" if block_type == "text" else block_type, "text": text})
+            continue
+
+        if block_type in _IMAGE_CONTENT_TYPES:
+            image_url = str(item.get("image_url", "")).strip()
+            if not image_url:
+                continue
+            normalized.append({"type": "input_image" if block_type == "image_url" else block_type, "image_url": image_url})
+            continue
+
+    return normalized
+
+
+def _content_from_legacy_message(*, role: str, message: Any) -> List[Dict[str, Any]]:
+    text = str(message or "").strip()
+    if not text:
+        return []
+    normalized_role = _normalize_role(role)
+    if normalized_role == "assistant":
+        return [{"type": "output_text", "text": text}]
+    return [{"type": "input_text", "text": text}]
+
+
+def _text_from_content(content: List[Dict[str, Any]]) -> str:
+    text_parts: List[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type", "")).strip().lower()
+        if block_type not in _TEXT_CONTENT_TYPES:
+            continue
+        text = str(block.get("text", "")).strip()
+        if text:
+            text_parts.append(text)
+    return "\n".join(text_parts).strip()
 
 
 def _normalize_title(value: Any) -> Optional[str]:
@@ -212,6 +276,7 @@ class ConversationStoreBackend:
         conversation_id: str,
         message: str,
         role: str,
+        content: Optional[List[Dict[str, Any]]] = None,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
         model_display_name: Optional[str] = None,
@@ -300,17 +365,23 @@ class InMemoryConversationStore(ConversationStoreBackend):
         conversation_id: str,
         message: str,
         role: str,
+        content: Optional[List[Dict[str, Any]]] = None,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
         model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = _now_iso()
+        normalized_content = _normalize_content_blocks(content)
+        if not normalized_content:
+            normalized_content = _content_from_legacy_message(role=role, message=message)
+        normalized_message = _text_from_content(normalized_content) or str(message or "").strip()
         entry = _normalized_message(
             {
                 "message_id": uuid.uuid4().hex,
                 "role": role,
-                "message": message,
+                "message": normalized_message,
+                "content": normalized_content,
                 "created_at": now,
                 "model_id": model_id,
                 "model_name": model_name,
@@ -446,6 +517,7 @@ class PostgresConversationStore(ConversationStoreBackend):
             conversation_id TEXT NOT NULL,
             role TEXT NOT NULL,
             message TEXT NOT NULL,
+            content_json JSONB NOT NULL DEFAULT '[]'::jsonb,
             model_id TEXT,
             model_name TEXT,
             model_display_name TEXT,
@@ -458,6 +530,8 @@ class PostgresConversationStore(ConversationStoreBackend):
 
         ALTER TABLE conversation_messages
             ADD COLUMN IF NOT EXISTS model_id TEXT;
+        ALTER TABLE conversation_messages
+            ADD COLUMN IF NOT EXISTS content_json JSONB NOT NULL DEFAULT '[]'::jsonb;
         ALTER TABLE conversation_messages
             ADD COLUMN IF NOT EXISTS model_name TEXT;
         ALTER TABLE conversation_messages
@@ -582,13 +656,17 @@ class PostgresConversationStore(ConversationStoreBackend):
         conversation_id: str,
         message: str,
         role: str,
+        content: Optional[List[Dict[str, Any]]] = None,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
         model_display_name: Optional[str] = None,
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         normalized_role = _normalize_role(role)
-        message_text = str(message)
+        normalized_content = _normalize_content_blocks(content)
+        if not normalized_content:
+            normalized_content = _content_from_legacy_message(role=normalized_role, message=message)
+        message_text = _text_from_content(normalized_content) or str(message or "").strip()
         message_id = uuid.uuid4().hex
         normalized_model_id = str(model_id).strip() if model_id is not None else None
         normalized_model_name = str(model_name).strip() if model_name is not None else None
@@ -626,9 +704,9 @@ class PostgresConversationStore(ConversationStoreBackend):
                     """
                     INSERT INTO conversation_messages (
                         message_id, tenant_id, user_id, conversation_id, role, message,
-                        model_id, model_name, model_display_name, provider, created_at
+                        content_json, model_id, model_name, model_display_name, provider, created_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, NOW())
                     """,
                     (
                         message_id,
@@ -637,6 +715,7 @@ class PostgresConversationStore(ConversationStoreBackend):
                         conversation_id,
                         normalized_role,
                         message_text,
+                        json.dumps(normalized_content, ensure_ascii=False),
                         normalized_model_id,
                         normalized_model_name,
                         normalized_model_display_name,
@@ -708,6 +787,11 @@ class PostgresConversationStore(ConversationStoreBackend):
                     message_id = normalized["message_id"].strip() or uuid.uuid4().hex
                     role = _normalize_role(normalized["role"])
                     message_text = normalized["message"]
+                    content_value = normalized.get("content")
+                    normalized_content = _normalize_content_blocks(content_value)
+                    if not normalized_content:
+                        normalized_content = _content_from_legacy_message(role=role, message=message_text)
+                    normalized_message_text = _text_from_content(normalized_content) or message_text
                     created_at = _parse_iso_datetime(normalized["created_at"])
                     model_id = (
                         str(normalized.get("model_id")).strip()
@@ -734,8 +818,8 @@ class PostgresConversationStore(ConversationStoreBackend):
                         """
                         INSERT INTO conversation_messages (
                             message_id, tenant_id, user_id, conversation_id, role, message,
-                            model_id, model_name, model_display_name, provider, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            content_json, model_id, model_name, model_display_name, provider, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)
                         """,
                         (
                             message_id,
@@ -743,7 +827,8 @@ class PostgresConversationStore(ConversationStoreBackend):
                             user_id,
                             conversation_id,
                             role,
-                            message_text,
+                            normalized_message_text,
+                            json.dumps(normalized_content, ensure_ascii=False),
                             model_id,
                             model_name,
                             model_display_name,
@@ -838,7 +923,7 @@ class PostgresConversationStore(ConversationStoreBackend):
 
             cur.execute(
                 """
-                SELECT message_id, role, message, model_id, model_name, model_display_name, provider, created_at
+                SELECT message_id, role, message, content_json, model_id, model_name, model_display_name, provider, created_at
                 FROM conversation_messages
                 WHERE tenant_id = %s AND user_id = %s AND conversation_id = %s
                 ORDER BY created_at ASC, message_id ASC
@@ -853,11 +938,12 @@ class PostgresConversationStore(ConversationStoreBackend):
                     "message_id": row[0],
                     "role": row[1],
                     "message": row[2],
-                    "model_id": row[3],
-                    "model_name": row[4],
-                    "model_display_name": row[5],
-                    "provider": row[6],
-                    "created_at": _to_iso(row[7]),
+                    "content": row[3],
+                    "model_id": row[4],
+                    "model_name": row[5],
+                    "model_display_name": row[6],
+                    "provider": row[7],
+                    "created_at": _to_iso(row[8]),
                 }
             )
             for row in rows
@@ -1105,6 +1191,7 @@ class RedisHotConversationStore:
         conversation_id: str,
         message: str,
         role: str,
+        content: Optional[List[Dict[str, Any]]] = None,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
         model_display_name: Optional[str] = None,
@@ -1129,6 +1216,7 @@ class RedisHotConversationStore:
                 "message_id": uuid.uuid4().hex,
                 "role": normalized_role,
                 "message": str(message),
+                "content": content,
                 "created_at": now_iso,
                 "model_id": model_id,
                 "model_name": model_name,
@@ -1434,6 +1522,7 @@ class HybridConversationStore(ConversationStoreBackend):
         conversation_id: str,
         message: str,
         role: str,
+        content: Optional[List[Dict[str, Any]]] = None,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
         model_display_name: Optional[str] = None,
@@ -1448,6 +1537,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 conversation_id=conversation_id,
                 message=message,
                 role=role,
+                content=content,
                 model_id=model_id,
                 model_name=model_name,
                 model_display_name=model_display_name,
@@ -1480,6 +1570,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 conversation_id=conversation_id,
                 message=message,
                 role=role,
+                content=content,
                 model_id=model_id,
                 model_name=model_name,
                 model_display_name=model_display_name,
@@ -1493,6 +1584,7 @@ class HybridConversationStore(ConversationStoreBackend):
                 conversation_id=conversation_id,
                 message=message,
                 role=role,
+                content=content,
                 model_id=model_id,
                 model_name=model_name,
                 model_display_name=model_display_name,
@@ -1653,6 +1745,7 @@ class ConversationStore:
         conversation_id: str,
         message: str,
         role: str = "user",
+        content: Optional[List[Dict[str, Any]]] = None,
         model_id: Optional[str] = None,
         model_name: Optional[str] = None,
         model_display_name: Optional[str] = None,
@@ -1665,6 +1758,7 @@ class ConversationStore:
             conversation_id=conversation_id,
             message=message,
             role=role,
+            content=content,
             model_id=model_id,
             model_name=model_name,
             model_display_name=model_display_name,
