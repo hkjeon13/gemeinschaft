@@ -360,13 +360,6 @@ async def _stream_assistant_reply(
     try:
         while True:
             event, data = await event_queue.get()
-            if event == "done":
-                await run_in_threadpool(
-                    conversation_store.mark_conversation_read,
-                    tenant_id=tenant_id,
-                    user_id=user_id,
-                    conversation_id=str(data.get("conversation_id") or ""),
-                )
             yield _sse(event, data)
             if event in {"done", "error"}:
                 return
@@ -670,12 +663,6 @@ async def create_dialogue(
         )
 
     if generated_conversation is not None:
-        await run_in_threadpool(
-            conversation_store.mark_conversation_read,
-            tenant_id=access.tenant,
-            user_id=access.subject,
-            conversation_id=conversation_id,
-        )
         return generated_conversation
     return conversation
 
