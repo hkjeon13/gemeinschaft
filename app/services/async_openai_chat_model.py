@@ -308,30 +308,41 @@ class AsyncOpenAIChatModel:
         payload: list[dict[str, Any]] = []
         for item in messages:
             role = str(item["role"]).strip().lower()
+            if role not in {"user", "assistant", "system", "developer"}:
+                continue
             content = item["content"]
             if not isinstance(content, list):
                 continue
 
-            blocks: list[dict[str, Any]] = []
+            text_blocks: list[str] = []
+            media_blocks: list[dict[str, Any]] = []
             for block in content:
                 block_type = str(block.get("type", "")).strip().lower()
                 if block_type in _TEXT_CONTENT_TYPES:
                     text = str(block.get("text", "")).strip()
                     if not text:
                         continue
-                    out_type = "output_text" if role == "assistant" else "input_text"
-                    blocks.append({"type": out_type, "text": text})
+                    text_blocks.append(text)
                     continue
 
                 if block_type in _IMAGE_CONTENT_TYPES:
                     image_url = str(block.get("image_url", "")).strip()
                     if not image_url:
                         continue
-                    blocks.append({"type": "input_image", "image_url": self._resolve_image_reference(image_url)})
+                    media_blocks.append({"type": "input_image", "image_url": self._resolve_image_reference(image_url)})
 
-            if not blocks:
+            if not text_blocks and not media_blocks:
                 continue
-            payload.append({"role": role, "content": blocks})
+
+            if media_blocks:
+                mixed_blocks: list[dict[str, Any]] = []
+                for text in text_blocks:
+                    mixed_blocks.append({"type": "input_text", "text": text})
+                mixed_blocks.extend(media_blocks)
+                payload.append({"type": "message", "role": role, "content": mixed_blocks})
+                continue
+
+            payload.append({"type": "message", "role": role, "content": "\n".join(text_blocks).strip()})
         return payload
 
     def _message_to_chat_payload(self, item: dict[str, Any]) -> dict[str, Any]:
