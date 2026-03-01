@@ -73,7 +73,42 @@ def _normalize_role(role: str) -> str:
     return "user"
 
 
-def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_model_id(model_id: Any) -> Optional[str]:
+    if model_id is None:
+        return None
+    value = str(model_id).strip()
+    if not value:
+        return None
+    return value
+
+
+def _resolve_message_model_id(*, role_hint: str, user_id: Optional[str], model_id: Any) -> str:
+    normalized_model_id = _normalize_model_id(model_id)
+    if normalized_model_id is not None:
+        return normalized_model_id
+
+    normalized_role = _normalize_role(role_hint)
+    if normalized_role == "user":
+        if user_id:
+            return str(user_id).strip()
+        return "user"
+    if normalized_role == "assistant":
+        return "assistant"
+    if normalized_role == "system":
+        return "system"
+    return str(user_id or "assistant").strip() or "assistant"
+
+
+def _role_from_user_and_model_id(*, user_id: Optional[str], model_id: str) -> str:
+    normalized_user_id = str(user_id or "").strip()
+    if normalized_user_id and model_id == normalized_user_id:
+        return "user"
+    if not normalized_user_id and model_id == "user":
+        return "user"
+    return "assistant"
+
+
+def _normalized_message(entry: Dict[str, Any], *, user_id: Optional[str] = None) -> Dict[str, Any]:
     message_id = entry.get("message_id")
     created_at = entry.get("created_at")
     message = entry.get("message")
@@ -84,21 +119,31 @@ def _normalized_message(entry: Dict[str, Any]) -> Dict[str, Any]:
     provider = entry.get("provider")
     content = entry.get("content")
 
+    resolved_model_id = _resolve_message_model_id(
+        role_hint=str(role),
+        user_id=user_id,
+        model_id=model_id,
+    )
+    derived_role = _role_from_user_and_model_id(user_id=user_id, model_id=resolved_model_id)
+
     normalized_content = _normalize_content_blocks(content)
     if not normalized_content:
-        normalized_content = _content_from_legacy_message(role=str(role), message=message)
+        normalized_content = _content_from_legacy_message(
+            is_user_message=(derived_role == "user"),
+            message=message,
+        )
     message_text = _text_from_content(normalized_content)
     if not message_text and isinstance(message, str) and message.strip():
         message_text = message.strip()
 
     normalized = {
         "message_id": str(message_id or ""),
-        "role": _normalize_role(str(role)),
+        "role": derived_role,
         "message": message_text,
         "content": normalized_content,
         "created_at": str(created_at or _now_iso()),
     }
-    normalized["model_id"] = str(model_id).strip() if model_id is not None else None
+    normalized["model_id"] = resolved_model_id
     normalized["model_name"] = str(model_name).strip() if model_name is not None else None
     normalized["model_display_name"] = str(model_display_name).strip() if model_display_name is not None else None
     normalized["provider"] = str(provider).strip().lower() if provider is not None else None
@@ -134,14 +179,13 @@ def _normalize_content_blocks(content: Any) -> List[Dict[str, Any]]:
     return normalized
 
 
-def _content_from_legacy_message(*, role: str, message: Any) -> List[Dict[str, Any]]:
+def _content_from_legacy_message(*, is_user_message: bool, message: Any) -> List[Dict[str, Any]]:
     text = str(message or "").strip()
     if not text:
         return []
-    normalized_role = _normalize_role(role)
-    if normalized_role == "assistant":
-        return [{"type": "output_text", "text": text}]
-    return [{"type": "input_text", "text": text}]
+    if is_user_message:
+        return [{"type": "input_text", "text": text}]
+    return [{"type": "output_text", "text": text}]
 
 
 def _text_from_content(content: List[Dict[str, Any]]) -> str:
@@ -188,21 +232,23 @@ def _resolve_conversation_title(conversation: Dict[str, Any]) -> str:
     if explicit:
         return explicit
     messages = conversation.get("messages", [])
-    normalized_messages = [_normalized_message(item) for item in messages if isinstance(item, dict)]
+    owner_id = str(conversation.get("user_id") or "").strip() or None
+    normalized_messages = [_normalized_message(item, user_id=owner_id) for item in messages if isinstance(item, dict)]
     inferred = _title_from_messages(normalized_messages)
     if inferred:
         return inferred
     return "New conversation"
 
 
-def _has_unread_assistant_messages(messages: List[Dict[str, Any]], last_read_at: Optional[Any]) -> bool:
+def _has_unread_assistant_messages(messages: List[Dict[str, Any]], last_read_at: Optional[Any], *, user_id: str) -> bool:
     if not messages:
         return False
     cutoff = _to_epoch(last_read_at) if last_read_at else float("-inf")
     for item in messages:
-        if str(item.get("role", "")).strip().lower() != "assistant":
+        normalized = _normalized_message(item, user_id=user_id)
+        if normalized["role"] != "assistant":
             continue
-        created_at = item.get("created_at")
+        created_at = normalized.get("created_at")
         if _to_epoch(created_at) > cutoff:
             return True
     return False
@@ -324,8 +370,9 @@ class InMemoryConversationStore(ConversationStoreBackend):
                         "message_count": len(messages),
                         "updated_at": conversation["updated_at"],
                         "has_unread": _has_unread_assistant_messages(
-                            [_normalized_message(item) for item in messages],
+                            [_normalized_message(item, user_id=user_id) for item in messages],
                             conversation.get("last_read_at"),
+                            user_id=user_id,
                         ),
                     }
                 )
@@ -354,7 +401,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 "tenant_id": tenant_id,
                 "user_id": user_id,
                 "title": _resolve_conversation_title(conversation),
-                "messages": [_normalized_message(item) for item in conversation["messages"]],
+                "messages": [_normalized_message(item, user_id=user_id) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
 
@@ -372,22 +419,33 @@ class InMemoryConversationStore(ConversationStoreBackend):
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         now = _now_iso()
+        normalized_role = _normalize_role(role)
+        resolved_model_id = _resolve_message_model_id(
+            role_hint=normalized_role,
+            user_id=user_id,
+            model_id=model_id,
+        )
+        is_user_message = resolved_model_id == user_id
         normalized_content = _normalize_content_blocks(content)
         if not normalized_content:
-            normalized_content = _content_from_legacy_message(role=role, message=message)
+            normalized_content = _content_from_legacy_message(
+                is_user_message=is_user_message,
+                message=message,
+            )
         normalized_message = _text_from_content(normalized_content) or str(message or "").strip()
         entry = _normalized_message(
             {
                 "message_id": uuid.uuid4().hex,
-                "role": role,
+                "role": normalized_role,
                 "message": normalized_message,
                 "content": normalized_content,
                 "created_at": now,
-                "model_id": model_id,
+                "model_id": resolved_model_id,
                 "model_name": model_name,
                 "model_display_name": model_display_name,
                 "provider": provider,
-            }
+            },
+            user_id=user_id,
         )
 
         with self._lock:
@@ -396,6 +454,8 @@ class InMemoryConversationStore(ConversationStoreBackend):
             conversation = user_conversations.setdefault(
                 conversation_id,
                 {
+                    "tenant_id": tenant_id,
+                    "user_id": user_id,
                     "messages": [],
                     "updated_at": now,
                     "title": None,
@@ -407,7 +467,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
             conversation["visible"] = True
             conversation["hidden_at"] = None
             conversation["messages"].append(entry)
-            if _normalize_role(role) == "user":
+            if is_user_message:
                 conversation["last_read_at"] = now
             if _normalize_title(conversation.get("title")) is None:
                 conversation["title"] = _title_from_messages(conversation["messages"]) or "New conversation"
@@ -418,7 +478,7 @@ class InMemoryConversationStore(ConversationStoreBackend):
                 "tenant_id": tenant_id,
                 "user_id": user_id,
                 "title": _resolve_conversation_title(conversation),
-                "messages": [_normalized_message(item) for item in conversation["messages"]],
+                "messages": [_normalized_message(item, user_id=user_id) for item in conversation["messages"]],
                 "updated_at": conversation["updated_at"],
             }
 
@@ -539,6 +599,16 @@ class PostgresConversationStore(ConversationStoreBackend):
         ALTER TABLE conversation_messages
             ADD COLUMN IF NOT EXISTS provider TEXT;
 
+        UPDATE conversation_messages
+        SET model_id = user_id
+        WHERE (model_id IS NULL OR TRIM(model_id) = '')
+          AND role = 'user';
+
+        UPDATE conversation_messages
+        SET model_id = 'assistant'
+        WHERE (model_id IS NULL OR TRIM(model_id) = '')
+          AND role <> 'user';
+
         UPDATE conversations c
         SET title = LEFT(
             COALESCE(
@@ -603,7 +673,10 @@ class PostgresConversationStore(ConversationStoreBackend):
                             WHERE mx.tenant_id = c.tenant_id
                               AND mx.user_id = c.user_id
                               AND mx.conversation_id = c.conversation_id
-                              AND mx.role = 'assistant'
+                              AND COALESCE(
+                                    NULLIF(mx.model_id, ''),
+                                    CASE WHEN mx.role = 'user' THEN c.user_id ELSE 'assistant' END
+                                  ) <> c.user_id
                               AND mx.created_at > COALESCE(c.last_read_at, c.created_at)
                         ) AS has_unread
                     FROM conversations c
@@ -663,17 +736,26 @@ class PostgresConversationStore(ConversationStoreBackend):
         provider: Optional[str] = None,
     ) -> Dict[str, Any]:
         normalized_role = _normalize_role(role)
+        resolved_model_id = _resolve_message_model_id(
+            role_hint=normalized_role,
+            user_id=user_id,
+            model_id=model_id,
+        )
+        is_user_message = resolved_model_id == user_id
+        stored_role = "user" if is_user_message else "assistant"
         normalized_content = _normalize_content_blocks(content)
         if not normalized_content:
-            normalized_content = _content_from_legacy_message(role=normalized_role, message=message)
+            normalized_content = _content_from_legacy_message(
+                is_user_message=is_user_message,
+                message=message,
+            )
         message_text = _text_from_content(normalized_content) or str(message or "").strip()
         message_id = uuid.uuid4().hex
-        normalized_model_id = str(model_id).strip() if model_id is not None else None
+        normalized_model_id = resolved_model_id
         normalized_model_name = str(model_name).strip() if model_name is not None else None
         normalized_model_display_name = str(model_display_name).strip() if model_display_name is not None else None
         normalized_provider = str(provider).strip().lower() if provider is not None else None
-        title_candidate = _normalize_title(message_text) if normalized_role == "user" else None
-        is_user_message = normalized_role == "user"
+        title_candidate = _normalize_title(message_text) if is_user_message else None
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -713,7 +795,7 @@ class PostgresConversationStore(ConversationStoreBackend):
                         tenant_id,
                         user_id,
                         conversation_id,
-                        normalized_role,
+                        stored_role,
                         message_text,
                         json.dumps(normalized_content, ensure_ascii=False),
                         normalized_model_id,
@@ -753,7 +835,7 @@ class PostgresConversationStore(ConversationStoreBackend):
         messages = [item for item in raw_messages if isinstance(item, dict)]
         normalized_title = _normalize_title(conversation.get("title"))
         if normalized_title is None:
-            normalized_title = _title_from_messages([_normalized_message(item) for item in messages]) or "New conversation"
+            normalized_title = _title_from_messages([_normalized_message(item, user_id=user_id) for item in messages]) or "New conversation"
 
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -783,20 +865,24 @@ class PostgresConversationStore(ConversationStoreBackend):
                 )
 
                 for item in messages:
-                    normalized = _normalized_message(item)
+                    normalized = _normalized_message(item, user_id=user_id)
                     message_id = normalized["message_id"].strip() or uuid.uuid4().hex
-                    role = _normalize_role(normalized["role"])
+                    role = normalized["role"]
+                    is_user_message = role == "user"
                     message_text = normalized["message"]
                     content_value = normalized.get("content")
                     normalized_content = _normalize_content_blocks(content_value)
                     if not normalized_content:
-                        normalized_content = _content_from_legacy_message(role=role, message=message_text)
+                        normalized_content = _content_from_legacy_message(
+                            is_user_message=is_user_message,
+                            message=message_text,
+                        )
                     normalized_message_text = _text_from_content(normalized_content) or message_text
                     created_at = _parse_iso_datetime(normalized["created_at"])
-                    model_id = (
-                        str(normalized.get("model_id")).strip()
-                        if normalized.get("model_id") is not None
-                        else None
+                    model_id = _resolve_message_model_id(
+                        role_hint=role,
+                        user_id=user_id,
+                        model_id=normalized.get("model_id"),
                     )
                     model_name = (
                         str(normalized.get("model_name")).strip()
@@ -944,7 +1030,8 @@ class PostgresConversationStore(ConversationStoreBackend):
                     "model_display_name": row[6],
                     "provider": row[7],
                     "created_at": _to_iso(row[8]),
-                }
+                },
+                user_id=user_id,
             )
             for row in rows
         ]
@@ -957,7 +1044,11 @@ class PostgresConversationStore(ConversationStoreBackend):
             "messages": messages,
             "updated_at": _to_iso(header[2]),
             "last_read_at": _to_iso(header[3]) if header[3] is not None else None,
-            "has_unread": _has_unread_assistant_messages(messages, _to_iso(header[3]) if header[3] is not None else None),
+            "has_unread": _has_unread_assistant_messages(
+                messages,
+                _to_iso(header[3]) if header[3] is not None else None,
+                user_id=user_id,
+            ),
         }
 
 
@@ -1015,8 +1106,9 @@ class RedisHotConversationStore:
         dirty: bool,
         last_activity_epoch: float,
     ) -> str:
+        owner_id = str(conversation.get("user_id") or "").strip() or None
         normalized_messages = [
-            _normalized_message(item) for item in conversation.get("messages", []) if isinstance(item, dict)
+            _normalized_message(item, user_id=owner_id) for item in conversation.get("messages", []) if isinstance(item, dict)
         ]
         payload = {
             "conversation_id": str(conversation.get("conversation_id") or ""),
@@ -1055,7 +1147,14 @@ class RedisHotConversationStore:
             "tenant_id": str(payload.get("tenant_id") or "").strip(),
             "user_id": str(payload.get("user_id") or "").strip(),
             "title": _normalize_title(payload.get("title")),
-            "messages": [_normalized_message(item) for item in messages if isinstance(item, dict)],
+            "messages": [
+                _normalized_message(
+                    item,
+                    user_id=str(payload.get("user_id") or "").strip() or None,
+                )
+                for item in messages
+                if isinstance(item, dict)
+            ],
             "updated_at": str(payload.get("updated_at") or _now_iso()),
             "last_read_at": payload.get("last_read_at"),
             "_dirty": bool(payload.get("_dirty", False)),
@@ -1066,12 +1165,13 @@ class RedisHotConversationStore:
         return normalized
 
     def _public_payload(self, cached: Dict[str, Any]) -> Dict[str, Any]:
+        owner_id = str(cached.get("user_id") or "").strip() or None
         return {
             "conversation_id": cached["conversation_id"],
             "tenant_id": cached["tenant_id"],
             "user_id": cached["user_id"],
             "title": _resolve_conversation_title(cached),
-            "messages": [_normalized_message(item) for item in cached.get("messages", [])],
+            "messages": [_normalized_message(item, user_id=owner_id) for item in cached.get("messages", [])],
             "updated_at": cached["updated_at"],
             "last_read_at": cached.get("last_read_at"),
         }
@@ -1098,7 +1198,11 @@ class RedisHotConversationStore:
             "tenant_id": tenant_id,
             "user_id": user_id,
             "title": _resolve_conversation_title(conversation),
-            "messages": [_normalized_message(item) for item in conversation.get("messages", []) if isinstance(item, dict)],
+            "messages": [
+                _normalized_message(item, user_id=user_id)
+                for item in conversation.get("messages", [])
+                if isinstance(item, dict)
+            ],
             "updated_at": updated_at,
             "last_read_at": conversation.get("last_read_at"),
         }
@@ -1172,8 +1276,13 @@ class RedisHotConversationStore:
                     "message_count": len(cached.get("messages", [])),
                     "updated_at": cached["updated_at"],
                     "has_unread": _has_unread_assistant_messages(
-                        [_normalized_message(item) for item in cached.get("messages", []) if isinstance(item, dict)],
+                        [
+                            _normalized_message(item, user_id=cached["user_id"])
+                            for item in cached.get("messages", [])
+                            if isinstance(item, dict)
+                        ],
                         cached.get("last_read_at"),
+                        user_id=cached["user_id"],
                     ),
                 }
             )
@@ -1200,6 +1309,12 @@ class RedisHotConversationStore:
         now_iso = _now_iso()
         now_epoch = time.time()
         normalized_role = _normalize_role(role)
+        resolved_model_id = _resolve_message_model_id(
+            role_hint=normalized_role,
+            user_id=user_id,
+            model_id=model_id,
+        )
+        is_user_message = resolved_model_id == user_id
 
         existing = self.get_conversation(tenant_id=tenant_id, user_id=user_id, conversation_id=conversation_id)
         if existing is None:
@@ -1218,11 +1333,12 @@ class RedisHotConversationStore:
                 "message": str(message),
                 "content": content,
                 "created_at": now_iso,
-                "model_id": model_id,
+                "model_id": resolved_model_id,
                 "model_name": model_name,
                 "model_display_name": model_display_name,
                 "provider": provider,
-            }
+            },
+            user_id=user_id,
         )
 
         existing_messages = [item for item in existing.get("messages", []) if isinstance(item, dict)]
@@ -1239,7 +1355,7 @@ class RedisHotConversationStore:
             ),
             "messages": existing_messages,
             "updated_at": now_iso,
-            "last_read_at": now_iso if normalized_role == "user" else existing.get("last_read_at"),
+            "last_read_at": now_iso if is_user_message else existing.get("last_read_at"),
         }
 
         self.cache_conversation(updated, dirty=True, last_activity_epoch=now_epoch)

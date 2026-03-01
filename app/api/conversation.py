@@ -208,7 +208,12 @@ def _content_to_preview_text(content: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _conversation_to_openai_messages(conversation: dict[str, Any], max_messages: int = 20) -> list[dict[str, Any]]:
+def _conversation_to_openai_messages(
+    conversation: dict[str, Any],
+    *,
+    selected_model_id: str,
+    max_messages: int = 20,
+) -> list[dict[str, Any]]:
     messages = conversation.get("messages", [])
     if not isinstance(messages, list):
         return []
@@ -218,9 +223,8 @@ def _conversation_to_openai_messages(conversation: dict[str, Any], max_messages:
     for item in recent:
         if not isinstance(item, dict):
             continue
-        role = str(item.get("role", "user")).strip().lower()
-        if role not in {"user", "assistant", "system"}:
-            role = "user"
+        model_id = str(item.get("model_id", "")).strip()
+        role = "assistant" if model_id and model_id == selected_model_id else "user"
         content_blocks = _normalize_content_blocks(item.get("content"))
         if content_blocks:
             converted.append({"role": role, "content": content_blocks})
@@ -666,7 +670,10 @@ async def create_dialogue(
         )
     model_client = _chat_model(selected_model)
 
-    messages = _conversation_to_openai_messages(conversation)
+    messages = _conversation_to_openai_messages(
+        conversation,
+        selected_model_id=selected_model.model_id,
+    )
     if not messages:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to build chat messages.")
 
