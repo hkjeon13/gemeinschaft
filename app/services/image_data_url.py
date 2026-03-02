@@ -1,5 +1,6 @@
 import base64
 import binascii
+import io
 import re
 from typing import Optional, Set
 
@@ -17,11 +18,48 @@ _DEFAULT_ALLOWED_IMAGE_MIME_TYPES: Set[str] = {
 }
 
 
+def _sanitize_image_payload_or_raise(*, field_name: str, decoded: bytes) -> tuple[str, bytes]:
+    try:
+        from PIL import Image, ImageOps, UnidentifiedImageError
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Image processing dependency is unavailable. Install Pillow.",
+        )
+
+    try:
+        with Image.open(io.BytesIO(decoded)) as source:
+            normalized = ImageOps.exif_transpose(source).convert("RGBA")
+            flattened = Image.new("RGB", normalized.size, (255, 255, 255))
+            flattened.paste(normalized, mask=normalized.split()[3])
+            output = io.BytesIO()
+            # Always lossy re-encode to disrupt common steganography payloads.
+            flattened.save(output, format="JPEG", quality=85, optimize=True)
+            sanitized = output.getvalue()
+    except UnidentifiedImageError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must contain a decodable image payload.",
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} could not be processed as an image.",
+        )
+
+    if not sanitized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} image payload is empty.",
+        )
+    return "image/jpeg", sanitized
+
+
 def normalize_image_data_url_or_raise(
     *,
     field_name: str,
     value: str,
-    max_bytes: int,
+    max_bytes: Optional[int] = None,
     allowed_mime_types: Optional[Set[str]] = None,
 ) -> str:
     raw = value.strip()
@@ -64,11 +102,13 @@ def normalize_image_data_url_or_raise(
             detail=f"{field_name} image payload is empty.",
         )
 
-    if len(decoded) > max_bytes:
+    output_mime_type, sanitized_payload = _sanitize_image_payload_or_raise(field_name=field_name, decoded=decoded)
+
+    if max_bytes is not None and len(sanitized_payload) > max_bytes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"{field_name} exceeds size limit ({max_bytes} bytes).",
         )
 
-    canonical_encoded = base64.b64encode(decoded).decode("ascii")
-    return f"data:{mime_type};base64,{canonical_encoded}"
+    canonical_encoded = base64.b64encode(sanitized_payload).decode("ascii")
+    return f"data:{output_mime_type};base64,{canonical_encoded}"

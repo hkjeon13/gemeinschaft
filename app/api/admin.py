@@ -109,6 +109,7 @@ def _model_schema(item) -> AdminChatModelSchema:
         client_options=item.client_options,
         chat_create_options=item.chat_create_options,
         responses_create_options=item.responses_create_options,
+        image_data_url=item.image_data_url,
         api_key_refs=[
             AdminApiKeyRefSchema(
                 key_id=api_key_ref.key_id,
@@ -219,6 +220,7 @@ async def admin_create_model(payload: AdminChatModelCreateSchema, access: Access
         client_options=payload.client_options,
         chat_create_options=payload.chat_create_options,
         responses_create_options=payload.responses_create_options,
+        image_data_url=payload.image_data_url,
         api_key=payload.api_key,
         api_keys=payload.api_keys,
         webhook_secret=payload.webhook_secret,
@@ -245,6 +247,8 @@ async def admin_update_model(
         and payload.client_options is None
         and payload.chat_create_options is None
         and payload.responses_create_options is None
+        and payload.image_data_url is None
+        and payload.clear_image_data_url is None
         and payload.api_key is None
         and payload.api_keys is None
         and payload.append_api_keys is None
@@ -271,6 +275,8 @@ async def admin_update_model(
         client_options=payload.client_options,
         chat_create_options=payload.chat_create_options,
         responses_create_options=payload.responses_create_options,
+        image_data_url=payload.image_data_url,
+        clear_image_data_url=payload.clear_image_data_url,
         api_key=payload.api_key,
         api_keys=payload.api_keys,
         append_api_keys=payload.append_api_keys,

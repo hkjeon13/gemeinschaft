@@ -457,6 +457,7 @@ export async function getModels() {
     client_options: Record<string, unknown>;
     chat_create_options: Record<string, unknown>;
     responses_create_options: Record<string, unknown>;
+    image_data_url?: string | null;
     api_key_refs: Array<{
       key_id: string;
       masked_key: string;
@@ -482,6 +483,7 @@ export async function createModel(data: {
   client_options?: Record<string, unknown>;
   chat_create_options?: Record<string, unknown>;
   responses_create_options?: Record<string, unknown>;
+  image_data_url?: string;
   api_key?: string;
   api_keys?: string[];
   webhook_secret?: string;
@@ -507,6 +509,8 @@ export async function updateModel(
     client_options?: Record<string, unknown>;
     chat_create_options?: Record<string, unknown>;
     responses_create_options?: Record<string, unknown>;
+    image_data_url?: string;
+    clear_image_data_url?: boolean;
     api_key?: string;
     api_keys?: string[];
     append_api_keys?: string[];

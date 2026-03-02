@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
 import {
   getUsers,
@@ -31,6 +31,7 @@ interface Model {
   client_options: Record<string, unknown>;
   chat_create_options: Record<string, unknown>;
   responses_create_options: Record<string, unknown>;
+  image_data_url?: string | null;
   api_key_refs: Array<{
     key_id: string;
     masked_key: string;
@@ -190,6 +191,79 @@ function CloseBtn({ onClick }: { onClick: () => void }) {
         <path d="M3.72 3.72a.75.75 0 0 1 1.06 0L8 6.94l3.22-3.22a.75.75 0 1 1 1.06 1.06L9.06 8l3.22 3.22a.75.75 0 1 1-1.06 1.06L8 9.06l-3.22 3.22a.75.75 0 0 1-1.06-1.06L6.94 8 3.72 4.78a.75.75 0 0 1 0-1.06Z" />
       </svg>
     </button>
+  );
+}
+
+const MODEL_AVATAR_COLORS = [
+  { bg: '#0ea5e9', text: '#ffffff' },
+  { bg: '#6366f1', text: '#ffffff' },
+  { bg: '#10b981', text: '#ffffff' },
+  { bg: '#f59e0b', text: '#ffffff' },
+  { bg: '#ec4899', text: '#ffffff' },
+];
+
+function readImageAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) {
+      reject(new Error('이미지 파일만 업로드할 수 있습니다.'));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const value = typeof reader.result === 'string' ? reader.result : '';
+      if (!value) {
+        reject(new Error('이미지 파일을 읽을 수 없습니다.'));
+        return;
+      }
+      resolve(value);
+    };
+    reader.onerror = () => reject(new Error('이미지 파일 읽기에 실패했습니다.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function modelAvatarColor(modelId: string) {
+  let hash = 0;
+  for (let i = 0; i < modelId.length; i += 1) hash += modelId.charCodeAt(i);
+  return MODEL_AVATAR_COLORS[hash % MODEL_AVATAR_COLORS.length];
+}
+
+function modelInitials(name: string) {
+  const trimmed = name.trim();
+  if (!trimmed) return 'M';
+  const parts = trimmed.split(/[\s\-_]+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return trimmed.slice(0, 2).toUpperCase();
+}
+
+function ModelAvatarBadge({
+  modelId,
+  displayName,
+  imageDataUrl,
+  className = 'w-8 h-8',
+}: {
+  modelId: string;
+  displayName: string;
+  imageDataUrl?: string | null;
+  className?: string;
+}) {
+  if (imageDataUrl) {
+    return (
+      <img
+        src={imageDataUrl}
+        alt={displayName}
+        className={`${className} rounded-full object-cover border border-gray-200 bg-white`}
+      />
+    );
+  }
+  const color = modelAvatarColor(modelId);
+  return (
+    <div
+      className={`${className} rounded-full flex items-center justify-center font-semibold text-[10px]`}
+      style={{ background: color.bg, color: color.text }}
+    >
+      {modelInitials(displayName)}
+    </div>
   );
 }
 
@@ -498,6 +572,9 @@ export function AdminPage() {
   const [editingModel, setEditingModel] = useState<string | null>(null);
   const [editingModelData, setEditingModelData] = useState<Model | null>(null);
   const [modelForm, setModelForm] = useState<ModelForm>(emptyModelForm);
+  const [modelImageTargetId, setModelImageTargetId] = useState<string | null>(null);
+  const [modelImageUploadingId, setModelImageUploadingId] = useState<string | null>(null);
+  const modelImageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     const handler = () => setShowLoginModal(true);
@@ -539,6 +616,50 @@ export function AdminPage() {
   const handleLoginSuccess = async () => {
     setShowLoginModal(false);
     await loadData();
+  };
+
+  const applyModelImageToState = (modelId: string, imageDataUrl: string | null) => {
+    setModels((prev) =>
+      prev.map((item) => (item.model_id === modelId ? { ...item, image_data_url: imageDataUrl } : item))
+    );
+    setViewingModel((prev) =>
+      prev && prev.model_id === modelId ? { ...prev, image_data_url: imageDataUrl } : prev
+    );
+    setEditingModelData((prev) =>
+      prev && prev.model_id === modelId ? { ...prev, image_data_url: imageDataUrl } : prev
+    );
+  };
+
+  const triggerModelImageUpload = (modelId: string) => {
+    setModelImageTargetId(modelId);
+    modelImageInputRef.current?.click();
+  };
+
+  const handleModelImageChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const modelId = modelImageTargetId;
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!modelId || !file) {
+      setModelImageTargetId(null);
+      return;
+    }
+    setModelImageUploadingId(modelId);
+    try {
+      const imageDataUrl = await readImageAsDataUrl(file);
+      await updateModel(modelId, { image_data_url: imageDataUrl });
+      applyModelImageToState(modelId, imageDataUrl);
+    } catch (err) {
+      console.error(err);
+      if (err instanceof Error) {
+        if (err.message.includes('400')) alert('이미지 형식을 확인해주세요.');
+        else alert(err.message);
+      } else {
+        alert('모델 이미지 업로드 중 오류가 발생했습니다.');
+      }
+    } finally {
+      setModelImageUploadingId(null);
+      setModelImageTargetId(null);
+    }
   };
 
   const handleLogout = async () => {
@@ -704,6 +825,14 @@ export function AdminPage() {
 
   return (
     <div className="flex h-screen overflow-hidden">
+      <input
+        ref={modelImageInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={handleModelImageChange}
+      />
+
       {/* ── 모바일 오버레이 ── */}
       {sidebarOpen && (
         <div className="fixed inset-0 bg-black/40 z-30 md:hidden" onClick={() => setSidebarOpen(false)} />
@@ -878,8 +1007,30 @@ export function AdminPage() {
                     className="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 cursor-pointer transition-colors"
                     onClick={() => setViewingModel(model)}
                   >
-                    {/* 상태 dot */}
-                    <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${model.is_active ? 'bg-green-400' : 'bg-gray-300'}`} />
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        triggerModelImageUpload(model.model_id);
+                      }}
+                      className="relative flex-shrink-0"
+                      title="이미지를 클릭해 업로드/교체"
+                    >
+                      <ModelAvatarBadge
+                        modelId={model.model_id}
+                        displayName={model.display_name || model.model}
+                        imageDataUrl={model.image_data_url}
+                        className="w-8 h-8"
+                      />
+                      <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border border-white ${model.is_active ? 'bg-green-400' : 'bg-gray-300'}`} />
+                      {modelImageUploadingId === model.model_id && (
+                        <span className="absolute inset-0 rounded-full bg-black/35 flex items-center justify-center">
+                          <svg className="w-3.5 h-3.5 text-white animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                            <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                          </svg>
+                        </span>
+                      )}
+                    </button>
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5 min-w-0">
                         <p className="text-xs font-medium text-gray-800 truncate font-mono">{model.model_id}</p>

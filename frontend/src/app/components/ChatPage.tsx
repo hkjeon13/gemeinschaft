@@ -118,16 +118,10 @@ function formatDate(iso: string) {
   return d.toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' });
 }
 
-const MAX_UPLOAD_BYTES = 512 * 1024;
-
 function readImageFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     if (!file.type.startsWith('image/')) {
       reject(new Error('이미지 파일만 업로드할 수 있습니다.'));
-      return;
-    }
-    if (file.size > MAX_UPLOAD_BYTES) {
-      reject(new Error('이미지 파일은 512KB 이하만 업로드할 수 있습니다.'));
       return;
     }
 
@@ -894,15 +888,29 @@ function ProfileModal({
         ) : (
           <>
             <div className="px-5 py-5 flex flex-col items-center gap-4">
-              {profileImageDataUrl ? (
-                <img src={profileImageDataUrl} alt={name} className="w-16 h-16 rounded-full object-cover border border-gray-200" />
-              ) : (
-                <div className="w-16 h-16 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center">
-                  <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8">
-                    <path fillRule="evenodd" d="M7.5 6a4.5 4.5 0 1 1 9 0 4.5 4.5 0 0 1-9 0ZM3.751 20.105a8.25 8.25 0 0 1 16.498 0 .75.75 0 0 1-.437.695A18.683 18.683 0 0 1 12 22.5c-2.786 0-5.433-.608-7.812-1.7a.75.75 0 0 1-.437-.695Z" clipRule="evenodd" />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={saving}
+                className="group relative rounded-full focus:outline-none focus:ring-2 focus:ring-indigo-300 disabled:opacity-60"
+                title="이미지를 클릭해 업로드"
+              >
+                {profileImageDataUrl ? (
+                  <img src={profileImageDataUrl} alt={name} className="w-16 h-16 rounded-full object-cover border border-gray-200" />
+                ) : (
+                  <div className="w-16 h-16 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center">
+                    <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8">
+                      <path fillRule="evenodd" d="M7.5 6a4.5 4.5 0 1 1 9 0 4.5 4.5 0 0 1-9 0ZM3.751 20.105a8.25 8.25 0 0 1 16.498 0 .75.75 0 0 1-.437.695A18.683 18.683 0 0 1 12 22.5c-2.786 0-5.433-.608-7.812-1.7a.75.75 0 0 1-.437-.695Z" clipRule="evenodd" />
+                    </svg>
+                  </div>
+                )}
+                <span className="absolute inset-0 rounded-full bg-black/0 group-hover:bg-black/25 transition-colors flex items-center justify-center">
+                  <svg viewBox="0 0 20 20" fill="white" className="w-5 h-5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <path d="M4.25 4A2.25 2.25 0 0 0 2 6.25v7.5A2.25 2.25 0 0 0 4.25 16h11.5A2.25 2.25 0 0 0 18 13.75v-7.5A2.25 2.25 0 0 0 15.75 4h-2.09l-.76-1.52A1.5 1.5 0 0 0 11.56 1.5H8.44a1.5 1.5 0 0 0-1.34.98L6.34 4H4.25ZM10 13.5a3.25 3.25 0 1 0 0-6.5 3.25 3.25 0 0 0 0 6.5Z" />
                   </svg>
-                </div>
-              )}
+                </span>
+              </button>
+              <p className="text-[11px] text-gray-400 -mt-2">이미지를 클릭해 업로드</p>
 
               <div className="w-full space-y-3">
                 <div>
@@ -918,15 +926,7 @@ function ProfileModal({
                   <p>계정: {username}</p>
                   {email && <p className="mt-1">이메일: {email} {emailVerified ? '(인증됨)' : '(미인증)'}</p>}
                 </div>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => fileInputRef.current?.click()}
-                    disabled={saving}
-                    className="flex-1 px-3 py-2 text-xs rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    이미지 업로드
-                  </button>
+                <div className="flex justify-end">
                   <button
                     type="button"
                     onClick={handleRemoveImage}

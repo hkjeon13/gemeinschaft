@@ -437,8 +437,8 @@ def _email_verification_expires_minutes() -> int:
     return value
 
 
-def _profile_image_max_bytes() -> int:
-    raw = os.getenv("AUTH_PROFILE_IMAGE_MAX_BYTES", "524288").strip()
+def _profile_image_max_bytes() -> Optional[int]:
+    raw = os.getenv("AUTH_PROFILE_IMAGE_MAX_BYTES", "0").strip()
     try:
         value = int(raw)
     except ValueError:
@@ -447,10 +447,7 @@ def _profile_image_max_bytes() -> int:
             detail="AUTH_PROFILE_IMAGE_MAX_BYTES must be an integer.",
         )
     if value <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="AUTH_PROFILE_IMAGE_MAX_BYTES must be greater than 0.",
-        )
+        return None
     return value
 
 

@@ -41,6 +41,7 @@ class AdminChatModelSchema(BaseModel):
     client_options: Dict[str, Any]
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
+    image_data_url: Optional[str] = None
     api_key_refs: List[AdminApiKeyRefSchema]
     has_api_key: bool
     has_webhook_secret: bool
@@ -61,6 +62,7 @@ class AdminChatModelCreateSchema(BaseModel):
     client_options: Dict[str, Any] = Field(default_factory=dict)
     chat_create_options: Dict[str, Any] = Field(default_factory=dict)
     responses_create_options: Dict[str, Any] = Field(default_factory=dict)
+    image_data_url: Optional[str] = Field(default=None, min_length=1)
     api_key: Optional[str] = Field(default=None, min_length=1)
     api_keys: Optional[List[str]] = None
     webhook_secret: Optional[str] = Field(default=None, min_length=1)
@@ -78,6 +80,8 @@ class AdminChatModelUpdateSchema(BaseModel):
     client_options: Optional[Dict[str, Any]] = None
     chat_create_options: Optional[Dict[str, Any]] = None
     responses_create_options: Optional[Dict[str, Any]] = None
+    image_data_url: Optional[str] = Field(default=None, min_length=1)
+    clear_image_data_url: Optional[bool] = None
     api_key: Optional[str] = Field(default=None, min_length=1)
     api_keys: Optional[List[str]] = None
     append_api_keys: Optional[List[str]] = None

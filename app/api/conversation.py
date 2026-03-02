@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import random
-from typing import Any, AsyncIterator, List
+from typing import Any, AsyncIterator, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.concurrency import run_in_threadpool
@@ -72,8 +72,8 @@ def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
     return is_active and provider == "openai"
 
 
-def _conversation_model_image_max_bytes() -> int:
-    raw = os.getenv("CONVERSATION_MODEL_IMAGE_MAX_BYTES", "262144").strip()
+def _conversation_model_image_max_bytes() -> Optional[int]:
+    raw = os.getenv("CONVERSATION_MODEL_IMAGE_MAX_BYTES", "0").strip()
     try:
         value = int(raw)
     except ValueError:
@@ -82,10 +82,7 @@ def _conversation_model_image_max_bytes() -> int:
             detail="CONVERSATION_MODEL_IMAGE_MAX_BYTES must be an integer.",
         )
     if value <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="CONVERSATION_MODEL_IMAGE_MAX_BYTES must be greater than 0.",
-        )
+        return None
     return value
 
 
@@ -322,7 +319,7 @@ def _conversation_model_list_response(
                 model=model.model,
                 display_name=model.display_name,
                 description=model.description,
-                image_data_url=image_map.get(model.model_id),
+                image_data_url=image_map.get(model.model_id) or model.image_data_url,
             )
         )
     return ConversationAssignedModelListSchema(conversation_id=conversation_id, models=models)
@@ -734,7 +731,7 @@ async def conversation_model_list(access: AccessContext = Depends(require_access
                 description=item.description,
                 is_global_default=item.is_default,
                 is_user_default=(item.model_id == user_default_id),
-                image_data_url=model_images.get(item.model_id),
+                image_data_url=model_images.get(item.model_id) or item.image_data_url,
             )
         )
     return items

@@ -9,6 +9,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException, status
 
 from .database import database_url_from_settings, load_database_settings
+from .image_data_url import normalize_image_data_url_or_raise
 from .security_audit import emit_security_event
 
 try:
@@ -339,6 +340,28 @@ def _model_registry_backend_name() -> str:
     return "postgres" if settings.enabled else "memory"
 
 
+def _model_image_max_bytes() -> Optional[int]:
+    raw = os.getenv("MODEL_IMAGE_MAX_BYTES", "0").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="MODEL_IMAGE_MAX_BYTES must be an integer.",
+        )
+    if value <= 0:
+        return None
+    return value
+
+
+def _normalize_model_image_data_url_or_raise(image_data_url: str) -> str:
+    return normalize_image_data_url_or_raise(
+        field_name="image_data_url",
+        value=image_data_url,
+        max_bytes=_model_image_max_bytes(),
+    )
+
+
 def _fernet_or_raise() -> Fernet:
     raw = os.getenv("MODEL_SECRET_ENCRYPTION_KEY", "").strip()
     if not raw:
@@ -590,6 +613,7 @@ class StoredChatModel:
     client_options: Dict[str, Any]
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
+    image_data_url: Optional[str]
     encrypted_api_key: Optional[str]
     encrypted_webhook_secret: Optional[str]
     is_active: bool
@@ -610,6 +634,7 @@ class ChatModelRecord:
     client_options: Dict[str, Any]
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
+    image_data_url: Optional[str]
     api_key_refs: List[ApiKeyRef]
     has_api_key: bool
     has_webhook_secret: bool
@@ -631,6 +656,7 @@ class ResolvedChatModel:
     client_options: Dict[str, Any]
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
+    image_data_url: Optional[str]
     api_key: Optional[str]
     api_keys: List[str]
 
@@ -700,6 +726,7 @@ class InMemoryChatModelStore(ChatModelStore):
             client_options=dict(item.client_options),
             chat_create_options=dict(item.chat_create_options),
             responses_create_options=dict(item.responses_create_options),
+            image_data_url=item.image_data_url,
             encrypted_api_key=item.encrypted_api_key,
             encrypted_webhook_secret=item.encrypted_webhook_secret,
             is_active=item.is_active,
@@ -747,6 +774,7 @@ class PostgresChatModelStore(ChatModelStore):
             client_options JSONB NOT NULL DEFAULT '{}'::jsonb,
             chat_create_options JSONB NOT NULL DEFAULT '{}'::jsonb,
             responses_create_options JSONB NOT NULL DEFAULT '{}'::jsonb,
+            image_data_url TEXT,
             encrypted_api_key TEXT,
             encrypted_webhook_secret TEXT,
             is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -771,6 +799,9 @@ class PostgresChatModelStore(ChatModelStore):
             ADD COLUMN IF NOT EXISTS responses_create_options JSONB NOT NULL DEFAULT '{}'::jsonb;
 
         ALTER TABLE chat_models
+            ADD COLUMN IF NOT EXISTS image_data_url TEXT;
+
+        ALTER TABLE chat_models
             ADD COLUMN IF NOT EXISTS encrypted_webhook_secret TEXT;
         """
         with self._connect() as conn:
@@ -792,7 +823,7 @@ class PostgresChatModelStore(ChatModelStore):
                 cur.execute(
                     """
                     SELECT model_id, provider, openai_api, model_name, display_name, description,
-                           parameters, client_options, chat_create_options, responses_create_options,
+                           parameters, client_options, chat_create_options, responses_create_options, image_data_url,
                            encrypted_api_key, encrypted_webhook_secret,
                            is_active, is_default, created_at, updated_at
                     FROM chat_models
@@ -810,7 +841,7 @@ class PostgresChatModelStore(ChatModelStore):
                 cur.execute(
                     """
                     SELECT model_id, provider, openai_api, model_name, display_name, description,
-                           parameters, client_options, chat_create_options, responses_create_options,
+                           parameters, client_options, chat_create_options, responses_create_options, image_data_url,
                            encrypted_api_key, encrypted_webhook_secret,
                            is_active, is_default, created_at, updated_at
                     FROM chat_models
@@ -832,13 +863,13 @@ class PostgresChatModelStore(ChatModelStore):
                     """
                     INSERT INTO chat_models (
                         model_id, provider, client_type, openai_api, model_name, display_name, description,
-                        parameters, client_options, chat_create_options, responses_create_options,
+                        parameters, client_options, chat_create_options, responses_create_options, image_data_url,
                         encrypted_api_key, encrypted_webhook_secret,
                         is_active, is_default, created_at, updated_at
                     )
                     VALUES (
                         %s, %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                        %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s,
                         %s, %s,
                         %s, %s, %s::timestamptz, %s::timestamptz
                     )
@@ -854,6 +885,7 @@ class PostgresChatModelStore(ChatModelStore):
                         client_options = EXCLUDED.client_options,
                         chat_create_options = EXCLUDED.chat_create_options,
                         responses_create_options = EXCLUDED.responses_create_options,
+                        image_data_url = EXCLUDED.image_data_url,
                         encrypted_api_key = EXCLUDED.encrypted_api_key,
                         encrypted_webhook_secret = EXCLUDED.encrypted_webhook_secret,
                         is_active = EXCLUDED.is_active,
@@ -872,6 +904,7 @@ class PostgresChatModelStore(ChatModelStore):
                         json.dumps(model.client_options),
                         json.dumps(model.chat_create_options),
                         json.dumps(model.responses_create_options),
+                        model.image_data_url,
                         model.encrypted_api_key,
                         model.encrypted_webhook_secret,
                         model.is_active,
@@ -906,12 +939,13 @@ class PostgresChatModelStore(ChatModelStore):
             client_options=_json_dict_or_raise(client_options, "client_options"),
             chat_create_options=_json_dict_or_raise(chat_create_options, "chat_create_options"),
             responses_create_options=_json_dict_or_raise(responses_create_options, "responses_create_options"),
-            encrypted_api_key=row[10],
-            encrypted_webhook_secret=row[11],
-            is_active=bool(row[12]),
-            is_default=bool(row[13]),
-            created_at=row[14].isoformat().replace("+00:00", "Z") if hasattr(row[14], "isoformat") else str(row[14]),
-            updated_at=row[15].isoformat().replace("+00:00", "Z") if hasattr(row[15], "isoformat") else str(row[15]),
+            image_data_url=row[10],
+            encrypted_api_key=row[11],
+            encrypted_webhook_secret=row[12],
+            is_active=bool(row[13]),
+            is_default=bool(row[14]),
+            created_at=row[15].isoformat().replace("+00:00", "Z") if hasattr(row[15], "isoformat") else str(row[15]),
+            updated_at=row[16].isoformat().replace("+00:00", "Z") if hasattr(row[16], "isoformat") else str(row[16]),
         )
 
 
@@ -948,6 +982,7 @@ def _seed_default_model_if_empty() -> None:
             client_options={},
             chat_create_options={},
             responses_create_options={},
+            image_data_url=None,
             encrypted_api_key=None,
             encrypted_webhook_secret=None,
             is_active=True,
@@ -992,6 +1027,7 @@ def _to_public(item: StoredChatModel) -> ChatModelRecord:
         client_options=dict(item.client_options),
         chat_create_options=dict(item.chat_create_options),
         responses_create_options=dict(item.responses_create_options),
+        image_data_url=item.image_data_url,
         api_key_refs=_api_key_refs(api_key_items),
         has_api_key=bool(api_key_items),
         has_webhook_secret=bool(item.encrypted_webhook_secret),
@@ -1026,6 +1062,7 @@ def _set_default_model(model_id: str) -> None:
                 client_options=dict(item.client_options),
                 chat_create_options=dict(item.chat_create_options),
                 responses_create_options=dict(item.responses_create_options),
+                image_data_url=item.image_data_url,
                 encrypted_api_key=item.encrypted_api_key,
                 encrypted_webhook_secret=item.encrypted_webhook_secret,
                 is_active=item.is_active,
@@ -1063,6 +1100,7 @@ def create_chat_model(
     client_options: Dict[str, Any],
     chat_create_options: Dict[str, Any],
     responses_create_options: Dict[str, Any],
+    image_data_url: Optional[str],
     api_key: Optional[str],
     api_keys: Optional[List[str]],
     webhook_secret: Optional[str],
@@ -1087,6 +1125,9 @@ def create_chat_model(
         normalized_provider,
         responses_create_options,
     )
+    normalized_image_data_url = (
+        _normalize_model_image_data_url_or_raise(image_data_url) if image_data_url is not None else None
+    )
     requested_api_keys = _resolve_api_key_input_or_raise(api_key=api_key, api_keys=api_keys)
     requested_api_key_items = _new_api_key_items(requested_api_keys) if requested_api_keys else []
     encrypted_api_key = _encrypt_api_keys_or_raise(requested_api_key_items) if requested_api_key_items else None
@@ -1106,6 +1147,7 @@ def create_chat_model(
         client_options=normalized_client_options,
         chat_create_options=normalized_chat_create_options,
         responses_create_options=normalized_responses_create_options,
+        image_data_url=normalized_image_data_url,
         encrypted_api_key=encrypted_api_key,
         encrypted_webhook_secret=encrypted_webhook_secret,
         is_active=bool(is_active),
@@ -1148,6 +1190,8 @@ def update_chat_model(
     client_options: Optional[Dict[str, Any]] = None,
     chat_create_options: Optional[Dict[str, Any]] = None,
     responses_create_options: Optional[Dict[str, Any]] = None,
+    image_data_url: Optional[str] = None,
+    clear_image_data_url: Optional[bool] = None,
     api_key: Optional[str] = None,
     api_keys: Optional[List[str]] = None,
     append_api_keys: Optional[List[str]] = None,
@@ -1164,6 +1208,11 @@ def update_chat_model(
     existing = store.get_model(normalized_id)
     if existing is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Model not found.")
+    if clear_image_data_url is True and image_data_url is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="image_data_url and clear_image_data_url cannot be used together.",
+        )
 
     next_provider = existing.provider if provider is None else _normalize_provider_or_raise(provider)
     raw_openai_api = existing.openai_api if openai_api is None else openai_api
@@ -1196,6 +1245,12 @@ def update_chat_model(
             next_provider,
             responses_create_options,
         )
+
+    next_image_data_url = existing.image_data_url
+    if clear_image_data_url is True:
+        next_image_data_url = None
+    if image_data_url is not None:
+        next_image_data_url = _normalize_model_image_data_url_or_raise(image_data_url)
 
     next_api_key_items = _decrypt_api_keys_or_raise(existing.encrypted_api_key) if existing.encrypted_api_key else []
     if clear_api_key is True:
@@ -1256,6 +1311,7 @@ def update_chat_model(
             client_options=next_client_options,
             chat_create_options=next_chat_create_options,
             responses_create_options=next_responses_create_options,
+            image_data_url=next_image_data_url,
             encrypted_api_key=next_encrypted_api_key,
             encrypted_webhook_secret=next_encrypted_webhook_secret,
             is_active=next_active,
@@ -1357,6 +1413,7 @@ def resolve_chat_model(model_id: Optional[str] = None) -> ResolvedChatModel:
         client_options=resolved_client_options,
         chat_create_options=dict(selected.chat_create_options),
         responses_create_options=dict(selected.responses_create_options),
+        image_data_url=selected.image_data_url,
         api_key=decrypted_api_key,
         api_keys=decrypted_api_keys,
     )
