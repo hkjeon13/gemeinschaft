@@ -370,10 +370,10 @@ function ModelDetailPopup({
             <div>
               <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">API Key 목록</p>
               <div className="space-y-1">
-                {model.api_key_refs.map((ref) => (
+                {model.api_key_refs.map((ref, index) => (
                   <div key={ref.key_id} className="flex items-center justify-between gap-2 rounded-lg border border-gray-100 bg-gray-50 px-2 py-1.5">
                     <span className="text-[10px] text-gray-700 font-mono">{ref.masked_key}</span>
-                    <span className="text-[10px] text-gray-400 font-mono truncate max-w-[220px]">{ref.key_id}</span>
+                    <span className="text-[10px] text-gray-400">#{index + 1}</span>
                   </div>
                 ))}
               </div>
@@ -1097,9 +1097,9 @@ export function AdminPage() {
                     )}
                     {editingModel && (editingModelData?.api_key_refs.length ?? 0) > 0 && (
                       <div className="mt-2.5 space-y-1.5">
-                        <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">저장된 키 (UUID 기반 삭제)</p>
+                        <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">저장된 키 (선택 삭제)</p>
                         <div className="space-y-1">
-                          {(editingModelData?.api_key_refs ?? []).map((ref) => {
+                          {(editingModelData?.api_key_refs ?? []).map((ref, index) => {
                             const markedForRemoval = modelForm.remove_api_key_ids.includes(ref.key_id);
                             return (
                               <button
@@ -1114,7 +1114,7 @@ export function AdminPage() {
                                 } ${modelForm.clear_api_key ? 'opacity-50 cursor-not-allowed' : ''}`}
                               >
                                 <span className="text-[10px] font-mono">{ref.masked_key}</span>
-                                <span className="text-[10px] font-mono text-gray-400 truncate max-w-[170px]">{ref.key_id}</span>
+                                <span className="text-[10px] text-gray-400">#{index + 1}</span>
                                 <span className="text-[10px] flex-shrink-0">{markedForRemoval ? '삭제 예정' : '유지'}</span>
                               </button>
                             );

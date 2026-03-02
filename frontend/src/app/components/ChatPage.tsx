@@ -952,6 +952,7 @@ export function ChatPage() {
   const [showContinueModal, setShowContinueModal] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
+  const currentUserRef = useRef('');
   const continueRunningRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -960,8 +961,12 @@ export function ChatPage() {
 
   useEffect(() => { scrollToBottom(); }, [currentConversation?.messages, sending]);
   useEffect(() => { loadInitialData(); }, []);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
   useEffect(() => {
-    const handler = () => setShowLoginModal(true);
+    const handler = () => {
+      // 비로그인 초기 진입에서는 자동으로 모달을 띄우지 않는다.
+      if (currentUserRef.current) setShowLoginModal(true);
+    };
     window.addEventListener('auth:required', handler);
     return () => window.removeEventListener('auth:required', handler);
   }, []);
@@ -973,7 +978,10 @@ export function ChatPage() {
       setCurrentUser(meData.sub);
       setConversations(await getConversationList());
     } catch {
-      // auth:required 이벤트가 api.ts에서 발행됨 → LoginModal 표시
+      setCurrentUser('');
+      setConversations([]);
+      setCurrentConversation(null);
+      setSelectedConversationId(null);
     } finally {
       setLoading(false);
     }
@@ -1011,6 +1019,10 @@ export function ChatPage() {
   };
 
   const handleNewConversation = async () => {
+    if (!currentUser) {
+      setShowLoginModal(true);
+      return;
+    }
     setSidebarOpen(false); // 모바일: 새 대화 시 사이드바 닫기
     const id = `conv-${Date.now()}`;
     setSelectedConversationId(id);
@@ -1046,6 +1058,10 @@ export function ChatPage() {
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!currentUser) {
+      setShowLoginModal(true);
+      return;
+    }
     if (!inputMessage.trim() || !selectedConversationId || sending) return;
 
     const text = inputMessage.trim();
@@ -1132,12 +1148,12 @@ export function ChatPage() {
 
   const handleLogout = async () => {
     try { await logout(); } catch { /* ignore */ }
-    // 상태 초기화 후 로그인 모달 표시
+    // 로그아웃 후에는 채팅 화면만 유지하고, 채팅 액션 시 로그인 유도
     setCurrentUser('');
     setConversations([]);
     setCurrentConversation(null);
     setSelectedConversationId(null);
-    setShowLoginModal(true);
+    setShowLoginModal(false);
   };
 
   const handleStartContinue = async (settings: ContinueSettings) => {
@@ -1397,17 +1413,26 @@ export function ChatPage() {
               </svg>
             </button>
           )}
-          <div className="flex items-center gap-2.5">
-            <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center flex-shrink-0">
-              <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
-                <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM12.735 14c.618 0 1.093-.561.872-1.139a6.002 6.002 0 0 0-11.215 0c-.22.578.254 1.139.872 1.139h9.47Z" />
-              </svg>
+          {currentUser ? (
+            <div className="flex items-center gap-2.5">
+              <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center flex-shrink-0">
+                <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
+                  <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM12.735 14c.618 0 1.093-.561.872-1.139a6.002 6.002 0 0 0-11.215 0c-.22.578.254 1.139.872 1.139h9.47Z" />
+                </svg>
+              </div>
+              <span className="text-xs truncate flex-1 font-medium text-gray-500">
+                {currentUser}
+              </span>
+              <UserMenuButton username={currentUser} onLogout={handleLogout} />
             </div>
-            <span className="text-xs truncate flex-1 font-medium text-gray-500">
-              {currentUser || '사용자'}
-            </span>
-            <UserMenuButton username={currentUser || '사용자'} onLogout={handleLogout} />
-          </div>
+          ) : (
+            <button
+              onClick={() => setShowLoginModal(true)}
+              className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-indigo-600 hover:bg-indigo-50 transition-colors"
+            >
+              로그인
+            </button>
+          )}
         </div>
       </aside>
 
@@ -1600,6 +1625,12 @@ export function ChatPage() {
         <ContinueSettingsModal
           onConfirm={handleStartContinue}
           onClose={() => setShowContinueModal(false)}
+        />
+      )}
+      {showLoginModal && (
+        <LoginModal
+          onSuccess={handleLoginSuccess}
+          onClose={currentUser ? () => setShowLoginModal(false) : undefined}
         />
       )}
     </div>
