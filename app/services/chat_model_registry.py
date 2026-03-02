@@ -511,7 +511,7 @@ def _decrypt_api_keys_or_raise(token: str) -> List[StoredApiKey]:
     try:
         parsed = json.loads(decrypted)
     except ValueError:
-        return [StoredApiKey(key_id=_legacy_api_key(decrypted), key_value=decrypted)]
+        return [StoredApiKey(key_id=_legacy_api_key_id(decrypted), key_value=decrypted)]
 
     if isinstance(parsed, list):
         normalized: List[StoredApiKey] = []
@@ -522,7 +522,7 @@ def _decrypt_api_keys_or_raise(token: str) -> List[StoredApiKey]:
                 key_value = item.strip()
                 if not key_value or key_value in seen_values:
                     continue
-                key_id = _legacy_api_key(key_value)
+                key_id = _legacy_api_key_id(key_value)
                 seen_values.add(key_value)
                 seen_ids.add(key_id)
                 normalized.append(StoredApiKey(key_id=key_id, key_value=key_value))
@@ -551,7 +551,7 @@ def _decrypt_api_keys_or_raise(token: str) -> List[StoredApiKey]:
                 except HTTPException:
                     key_id = str(uuid4())
             else:
-                key_id = _legacy_api_key(key_value)
+                key_id = _legacy_api_key_id(key_value)
 
             if key_id in seen_ids:
                 key_id = str(uuid4())
@@ -565,8 +565,8 @@ def _decrypt_api_keys_or_raise(token: str) -> List[StoredApiKey]:
         value = parsed.strip()
         if not value:
             return []
-        return [StoredApiKey(key_id=_legacy_api_key(value), key_value=value)]
-    return [StoredApiKey(key_id=_legacy_api_key(decrypted), key_value=decrypted)]
+        return [StoredApiKey(key_id=_legacy_api_key_id(value), key_value=value)]
+    return [StoredApiKey(key_id=_legacy_api_key_id(decrypted), key_value=decrypted)]
 
 
 def _env_openai_api_keys() -> List[str]:
