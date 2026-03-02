@@ -215,6 +215,20 @@ export async function login(username: string, password: string) {
   });
 }
 
+// 회원가입
+export async function register(data: {
+  name: string;
+  username: string;
+  password: string;
+  email: string;
+}) {
+  return apiRequest<{ message: string; verification_required: boolean }>('/auth/register', {
+    method: 'POST',
+    body: JSON.stringify(data),
+    skipRefresh: true,
+  });
+}
+
 // 내 세션 조회
 export async function getMe() {
   return apiRequest('/auth/me');

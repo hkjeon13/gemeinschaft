@@ -1,10 +1,14 @@
 import base64
+import hashlib
 import json
 import os
+import re
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import bcrypt
 import jwt
@@ -15,6 +19,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt import ExpiredSignatureError, InvalidTokenError
 
 from .auth_user_store import StoredAuthUser, get_auth_user_store, initialize_auth_user_store
+from .email_delivery import send_verification_email
 from .request_security import (
     auth_require_dpop,
     csrf_cookie_name,
@@ -45,6 +50,9 @@ class AuthUser:
     role: str
     tenant: str
     scopes: List[str]
+    name: str = ""
+    email: Optional[str] = None
+    email_verified: bool = False
 
 
 @dataclass
@@ -54,6 +62,9 @@ class AuthUserRecord:
     role: str
     tenant: str
     scopes: List[str]
+    name: str
+    email: Optional[str]
+    email_verified: bool
 
 
 @dataclass
@@ -391,6 +402,43 @@ def _default_scopes() -> List[str]:
     return _parse_scopes(raw, "AUTH_DEFAULT_SCOPES")
 
 
+def _signup_default_role() -> str:
+    role = os.getenv("AUTH_SIGNUP_DEFAULT_ROLE", "member").strip()
+    if not role:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_SIGNUP_DEFAULT_ROLE must be a non-empty string.",
+        )
+    return role
+
+
+def _email_verification_required() -> bool:
+    raw = os.getenv("AUTH_EMAIL_VERIFICATION_REQUIRED", "true").strip().lower()
+    return raw in ("1", "true", "yes", "y")
+
+
+def _email_verification_expires_minutes() -> int:
+    raw = os.getenv("AUTH_EMAIL_VERIFICATION_EXPIRES_MINUTES", "30").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_EMAIL_VERIFICATION_EXPIRES_MINUTES must be an integer.",
+        )
+    if value <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_EMAIL_VERIFICATION_EXPIRES_MINUTES must be greater than 0.",
+        )
+    return value
+
+
+def _require_verified_email_for_login() -> bool:
+    raw = os.getenv("AUTH_REQUIRE_VERIFIED_EMAIL_FOR_LOGIN", "true").strip().lower()
+    return raw in ("1", "true", "yes", "y")
+
+
 def _allow_plaintext_passwords() -> bool:
     raw = os.getenv("AUTH_ALLOW_PLAINTEXT_PASSWORDS", "false").strip().lower()
     return raw in ("1", "true", "yes", "y")
@@ -479,6 +527,9 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
         role = "user"
         tenant = _default_tenant()
         scopes = _default_scopes()
+        name = username
+        email: Optional[str] = None
+        email_verified = False
         password_hash: Optional[str] = None
         plain_password: Optional[str] = None
 
@@ -488,6 +539,17 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
             role = config.get("role", "user")
             tenant = config.get("tenant", _default_tenant())
             scopes = _parse_scopes(config.get("scopes", _default_scopes()), f"AUTH user '{username}'")
+            name = config.get("name", username)
+            raw_email = config.get("email")
+            if raw_email is not None:
+                try:
+                    email = _normalize_email_or_raise(str(raw_email))
+                except HTTPException as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"AUTH user '{username}' email is invalid.",
+                    ) from exc
+            email_verified = bool(config.get("email_verified", False))
             password_hash = config.get("password_hash")
             plain_password = config.get("password")
         else:
@@ -507,6 +569,11 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"AUTH user '{username}' tenant must be a non-empty string.",
             )
+        if not isinstance(name, str) or not name.strip():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"AUTH user '{username}' name must be a non-empty string.",
+            )
 
         if password_hash is not None:
             if not isinstance(password_hash, str) or not password_hash:
@@ -521,6 +588,9 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
                 role=role,
                 tenant=tenant,
                 scopes=scopes,
+                name=name.strip(),
+                email=email,
+                email_verified=email_verified,
             )
             continue
 
@@ -544,6 +614,9 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
                 role=role,
                 tenant=tenant,
                 scopes=scopes,
+                name=name.strip(),
+                email=email,
+                email_verified=email_verified,
             )
             continue
 
@@ -578,6 +651,12 @@ def _seed_users_for_store(seed_config: Dict[str, AuthUserRecord]) -> Dict[str, S
             role=config.role,
             tenant=config.tenant,
             scopes=list(config.scopes),
+            name=config.name,
+            email=config.email,
+            email_verified=config.email_verified,
+            email_verified_at=datetime.now(timezone.utc) if config.email_verified else None,
+            email_verification_token_hash=None,
+            email_verification_expires_at=None,
         )
     return seeded
 
@@ -592,10 +671,13 @@ def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
         return None
 
     return AuthUser(
-        username=username,
+        username=user.username,
         role=user.role,
         tenant=user.tenant,
-        scopes=user.scopes,
+        scopes=list(user.scopes),
+        name=user.name,
+        email=user.email,
+        email_verified=user.email_verified,
     )
 
 
@@ -605,6 +687,41 @@ def _normalize_username_or_raise(username: str) -> str:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="username is required.",
+        )
+    return normalized
+
+
+def _normalize_name_or_raise(name: str) -> str:
+    normalized = name.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="name is required.",
+        )
+    if len(normalized) > 100:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="name must be at most 100 characters.",
+        )
+    return normalized
+
+
+def _normalize_email_or_raise(email: str) -> str:
+    normalized = email.strip().lower()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="email is required.",
+        )
+    if len(normalized) > 254:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="email must be at most 254 characters.",
+        )
+    if not re.fullmatch(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", normalized):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="email format is invalid.",
         )
     return normalized
 
@@ -647,6 +764,9 @@ def list_auth_users() -> List[AuthUser]:
             role=user.role,
             tenant=user.tenant,
             scopes=list(user.scopes),
+            name=user.name,
+            email=user.email,
+            email_verified=user.email_verified,
         )
         for user in users
     ]
@@ -662,6 +782,9 @@ def get_auth_user(username: str) -> Optional[AuthUser]:
         role=user.role,
         tenant=user.tenant,
         scopes=list(user.scopes),
+        name=user.name,
+        email=user.email,
+        email_verified=user.email_verified,
     )
 
 
@@ -683,6 +806,12 @@ def create_auth_user(username: str, password: str, role: str, tenant: str, scope
         role=_normalize_role_or_raise(role),
         tenant=_normalize_tenant_or_raise(tenant),
         scopes=_normalize_scope_values(scopes),
+        name=normalized_username,
+        email=None,
+        email_verified=False,
+        email_verified_at=None,
+        email_verification_token_hash=None,
+        email_verification_expires_at=None,
     )
     get_auth_user_store().upsert_user(stored)
 
@@ -699,6 +828,9 @@ def create_auth_user(username: str, password: str, role: str, tenant: str, scope
         role=stored.role,
         tenant=stored.tenant,
         scopes=stored.scopes,
+        name=stored.name,
+        email=stored.email,
+        email_verified=stored.email_verified,
     )
 
 
@@ -730,6 +862,12 @@ def update_auth_user(
         role=new_role,
         tenant=existing.tenant if tenant is None else _normalize_tenant_or_raise(tenant),
         scopes=existing.scopes if scopes is None else _normalize_scope_values(scopes),
+        name=existing.name,
+        email=existing.email,
+        email_verified=existing.email_verified,
+        email_verified_at=existing.email_verified_at,
+        email_verification_token_hash=existing.email_verification_token_hash,
+        email_verification_expires_at=existing.email_verification_expires_at,
     )
 
     get_auth_user_store().upsert_user(updated)
@@ -746,6 +884,9 @@ def update_auth_user(
         role=updated.role,
         tenant=updated.tenant,
         scopes=updated.scopes,
+        name=updated.name,
+        email=updated.email,
+        email_verified=updated.email_verified,
     )
 
 
@@ -770,6 +911,261 @@ def delete_auth_user(username: str) -> None:
         outcome="allow",
         target_user=normalized_username,
     )
+
+
+def _hash_email_verification_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _new_email_verification_token() -> str:
+    return secrets.token_urlsafe(48)
+
+
+def _build_verification_url(request: Request, token: str) -> str:
+    template = os.getenv("AUTH_EMAIL_VERIFY_URL_TEMPLATE", "").strip()
+    if template:
+        if "{token}" in template:
+            return template.replace("{token}", token)
+        parsed = urlsplit(template)
+        query_items = parse_qsl(parsed.query, keep_blank_values=True)
+        query_items.append(("token", token))
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query_items), parsed.fragment))
+
+    endpoint_url = str(request.url_for("verify_email_get"))
+    parsed = urlsplit(endpoint_url)
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    query_items.append(("token", token))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query_items), parsed.fragment))
+
+
+def _send_verification_email_or_raise(
+    *,
+    request: Request,
+    recipient_email: str,
+    recipient_name: str,
+    verification_token: str,
+) -> None:
+    verify_url = _build_verification_url(request=request, token=verification_token)
+    try:
+        send_verification_email(
+            recipient_email=recipient_email,
+            recipient_name=recipient_name,
+            verify_url=verify_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(exc),
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to deliver verification email.",
+        ) from exc
+
+
+def register_auth_user(
+    *,
+    name: str,
+    username: str,
+    password: str,
+    email: str,
+    request: Request,
+) -> AuthUser:
+    normalized_name = _normalize_name_or_raise(name)
+    normalized_username = _normalize_username_or_raise(username)
+    normalized_password = _normalize_password_or_raise(password)
+    normalized_email = _normalize_email_or_raise(email)
+    store = get_auth_user_store()
+
+    if store.get_user(normalized_username) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User already exists.",
+        )
+    if store.get_user_by_email(normalized_email) is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already exists.",
+        )
+
+    verification_required = _email_verification_required()
+    now = datetime.now(timezone.utc)
+    verification_token: Optional[str] = None
+    token_hash: Optional[str] = None
+    token_expires_at: Optional[datetime] = None
+    verified_at: Optional[datetime] = None
+
+    if verification_required:
+        verification_token = _new_email_verification_token()
+        token_hash = _hash_email_verification_token(verification_token)
+        token_expires_at = now + timedelta(minutes=_email_verification_expires_minutes())
+    else:
+        verified_at = now
+
+    stored = StoredAuthUser(
+        username=normalized_username,
+        password_hash=hash_password(normalized_password),
+        role=_signup_default_role(),
+        tenant=_default_tenant(),
+        scopes=_default_scopes(),
+        name=normalized_name,
+        email=normalized_email,
+        email_verified=not verification_required,
+        email_verified_at=verified_at,
+        email_verification_token_hash=token_hash,
+        email_verification_expires_at=token_expires_at,
+    )
+    store.upsert_user(stored)
+
+    if verification_required and verification_token is not None:
+        try:
+            _send_verification_email_or_raise(
+                request=request,
+                recipient_email=normalized_email,
+                recipient_name=normalized_name,
+                verification_token=verification_token,
+            )
+        except HTTPException:
+            # Email delivery failure 시 가입 레코드를 롤백해 재시도 가능하게 유지한다.
+            store.delete_user(stored.username)
+            raise
+
+    emit_security_event(
+        event_type="user_registered",
+        outcome="allow",
+        target_user=stored.username,
+        tenant=stored.tenant,
+        email=stored.email,
+        email_verified=stored.email_verified,
+    )
+    return AuthUser(
+        username=stored.username,
+        role=stored.role,
+        tenant=stored.tenant,
+        scopes=list(stored.scopes),
+        name=stored.name,
+        email=stored.email,
+        email_verified=stored.email_verified,
+    )
+
+
+def resend_verification_email(*, email: str, request: Request) -> None:
+    normalized_email = _normalize_email_or_raise(email)
+    store = get_auth_user_store()
+    user = store.get_user_by_email(normalized_email)
+    if user is None:
+        return
+    if user.email_verified:
+        return
+
+    verification_token = _new_email_verification_token()
+    token_hash = _hash_email_verification_token(verification_token)
+    token_expires_at = datetime.now(timezone.utc) + timedelta(minutes=_email_verification_expires_minutes())
+    updated = StoredAuthUser(
+        username=user.username,
+        password_hash=user.password_hash,
+        role=user.role,
+        tenant=user.tenant,
+        scopes=list(user.scopes),
+        name=user.name,
+        email=user.email,
+        email_verified=False,
+        email_verified_at=None,
+        email_verification_token_hash=token_hash,
+        email_verification_expires_at=token_expires_at,
+    )
+    store.upsert_user(updated)
+    _send_verification_email_or_raise(
+        request=request,
+        recipient_email=normalized_email,
+        recipient_name=user.name or user.username,
+        verification_token=verification_token,
+    )
+    emit_security_event(
+        event_type="email_verification_resent",
+        outcome="allow",
+        target_user=user.username,
+        email=normalized_email,
+    )
+
+
+def verify_email_token(token: str) -> AuthUser:
+    normalized_token = token.strip()
+    if not normalized_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification token is required.",
+        )
+
+    store = get_auth_user_store()
+    token_hash = _hash_email_verification_token(normalized_token)
+    user = store.get_user_by_email_verification_token_hash(token_hash)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification token is invalid.",
+        )
+
+    expires_at = user.email_verification_expires_at
+    now = datetime.now(timezone.utc)
+    if expires_at is None or expires_at <= now:
+        expired = StoredAuthUser(
+            username=user.username,
+            password_hash=user.password_hash,
+            role=user.role,
+            tenant=user.tenant,
+            scopes=list(user.scopes),
+            name=user.name,
+            email=user.email,
+            email_verified=False,
+            email_verified_at=None,
+            email_verification_token_hash=None,
+            email_verification_expires_at=None,
+        )
+        store.upsert_user(expired)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification token has expired.",
+        )
+
+    verified = StoredAuthUser(
+        username=user.username,
+        password_hash=user.password_hash,
+        role=user.role,
+        tenant=user.tenant,
+        scopes=list(user.scopes),
+        name=user.name,
+        email=user.email,
+        email_verified=True,
+        email_verified_at=now,
+        email_verification_token_hash=None,
+        email_verification_expires_at=None,
+    )
+    store.upsert_user(verified)
+    emit_security_event(
+        event_type="email_verified",
+        outcome="allow",
+        target_user=verified.username,
+        email=verified.email,
+    )
+    return AuthUser(
+        username=verified.username,
+        role=verified.role,
+        tenant=verified.tenant,
+        scopes=list(verified.scopes),
+        name=verified.name,
+        email=verified.email,
+        email_verified=True,
+    )
+
+
+def ensure_user_can_login(user: AuthUser) -> None:
+    if _require_verified_email_for_login() and user.email and not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Email verification is required.",
+        )
 
 
 def scopes_from_claims(claims: Dict[str, Any]) -> List[str]:
@@ -1259,6 +1655,8 @@ def validate_auth_settings() -> None:
     access_cookie_name()
     refresh_cookie_name()
     csrf_cookie_name()
+    _signup_default_role()
+    _email_verification_expires_minutes()
 
     login_rate_limit_settings()
     validate_security_state_settings()

@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from threading import Lock
 from typing import Dict, List, Optional
 
@@ -20,6 +21,12 @@ class StoredAuthUser:
     role: str
     tenant: str
     scopes: List[str]
+    name: str = ""
+    email: Optional[str] = None
+    email_verified: bool = False
+    email_verified_at: Optional[datetime] = None
+    email_verification_token_hash: Optional[str] = None
+    email_verification_expires_at: Optional[datetime] = None
 
 
 class AuthUserStore:
@@ -30,6 +37,12 @@ class AuthUserStore:
         raise NotImplementedError
 
     def get_user(self, username: str) -> Optional[StoredAuthUser]:
+        raise NotImplementedError
+
+    def get_user_by_email(self, email: str) -> Optional[StoredAuthUser]:
+        raise NotImplementedError
+
+    def get_user_by_email_verification_token_hash(self, token_hash: str) -> Optional[StoredAuthUser]:
         raise NotImplementedError
 
     def list_users(self) -> List[StoredAuthUser]:
@@ -79,7 +92,57 @@ class InMemoryAuthUserStore(AuthUserStore):
                 role=user.role,
                 tenant=user.tenant,
                 scopes=list(user.scopes),
+                name=user.name,
+                email=user.email,
+                email_verified=user.email_verified,
+                email_verified_at=user.email_verified_at,
+                email_verification_token_hash=user.email_verification_token_hash,
+                email_verification_expires_at=user.email_verification_expires_at,
             )
+
+    def get_user_by_email(self, email: str) -> Optional[StoredAuthUser]:
+        normalized_email = email.strip().lower()
+        if not normalized_email:
+            return None
+        with self._lock:
+            for user in self._users.values():
+                if (user.email or "").lower() == normalized_email:
+                    return StoredAuthUser(
+                        username=user.username,
+                        password_hash=user.password_hash,
+                        role=user.role,
+                        tenant=user.tenant,
+                        scopes=list(user.scopes),
+                        name=user.name,
+                        email=user.email,
+                        email_verified=user.email_verified,
+                        email_verified_at=user.email_verified_at,
+                        email_verification_token_hash=user.email_verification_token_hash,
+                        email_verification_expires_at=user.email_verification_expires_at,
+                    )
+        return None
+
+    def get_user_by_email_verification_token_hash(self, token_hash: str) -> Optional[StoredAuthUser]:
+        normalized_hash = token_hash.strip()
+        if not normalized_hash:
+            return None
+        with self._lock:
+            for user in self._users.values():
+                if user.email_verification_token_hash == normalized_hash:
+                    return StoredAuthUser(
+                        username=user.username,
+                        password_hash=user.password_hash,
+                        role=user.role,
+                        tenant=user.tenant,
+                        scopes=list(user.scopes),
+                        name=user.name,
+                        email=user.email,
+                        email_verified=user.email_verified,
+                        email_verified_at=user.email_verified_at,
+                        email_verification_token_hash=user.email_verification_token_hash,
+                        email_verification_expires_at=user.email_verification_expires_at,
+                    )
+        return None
 
     def list_users(self) -> List[StoredAuthUser]:
         with self._lock:
@@ -93,6 +156,12 @@ class InMemoryAuthUserStore(AuthUserStore):
                 role=user.role,
                 tenant=user.tenant,
                 scopes=list(user.scopes),
+                name=user.name,
+                email=user.email,
+                email_verified=user.email_verified,
+                email_verified_at=user.email_verified_at,
+                email_verification_token_hash=user.email_verification_token_hash,
+                email_verification_expires_at=user.email_verification_expires_at,
             )
             for user in users
         ]
@@ -105,6 +174,12 @@ class InMemoryAuthUserStore(AuthUserStore):
                 role=user.role,
                 tenant=user.tenant,
                 scopes=list(user.scopes),
+                name=user.name,
+                email=user.email,
+                email_verified=user.email_verified,
+                email_verified_at=user.email_verified_at,
+                email_verification_token_hash=user.email_verification_token_hash,
+                email_verification_expires_at=user.email_verification_expires_at,
             )
 
     def delete_user(self, username: str) -> bool:
@@ -144,13 +219,40 @@ class PostgresAuthUserStore(AuthUserStore):
             role TEXT NOT NULL,
             tenant TEXT NOT NULL,
             scopes TEXT[] NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            email TEXT,
+            email_verified BOOLEAN NOT NULL DEFAULT FALSE,
+            email_verified_at TIMESTAMPTZ,
+            email_verification_token_hash TEXT,
+            email_verification_expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_unique
+            ON auth_users (email)
+            WHERE email IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_auth_users_email_verification_token_hash
+            ON auth_users (email_verification_token_hash)
+            WHERE email_verification_token_hash IS NOT NULL;
+        """
+        migration_sql = """
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email TEXT;
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verification_token_hash TEXT;
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verification_expires_at TIMESTAMPTZ;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_unique
+            ON auth_users (email)
+            WHERE email IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_auth_users_email_verification_token_hash
+            ON auth_users (email_verification_token_hash)
+            WHERE email_verification_token_hash IS NOT NULL;
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(ddl)
+                cur.execute(migration_sql)
             conn.commit()
 
     def count_users(self) -> int:
@@ -166,7 +268,8 @@ class PostgresAuthUserStore(AuthUserStore):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT username, password_hash, role, tenant, scopes
+                    SELECT username, password_hash, role, tenant, scopes, name, email,
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
                     FROM auth_users
                     WHERE username = %s
                     """,
@@ -184,6 +287,82 @@ class PostgresAuthUserStore(AuthUserStore):
             role=row[2],
             tenant=row[3],
             scopes=list(row[4] or []),
+            name=row[5] or "",
+            email=row[6],
+            email_verified=bool(row[7]),
+            email_verified_at=row[8],
+            email_verification_token_hash=row[9],
+            email_verification_expires_at=row[10],
+        )
+
+    def get_user_by_email(self, email: str) -> Optional[StoredAuthUser]:
+        normalized_email = email.strip().lower()
+        if not normalized_email:
+            return None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT username, password_hash, role, tenant, scopes, name, email,
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
+                    FROM auth_users
+                    WHERE email = %s
+                    """,
+                    (normalized_email,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        if row is None:
+            return None
+
+        return StoredAuthUser(
+            username=row[0],
+            password_hash=row[1],
+            role=row[2],
+            tenant=row[3],
+            scopes=list(row[4] or []),
+            name=row[5] or "",
+            email=row[6],
+            email_verified=bool(row[7]),
+            email_verified_at=row[8],
+            email_verification_token_hash=row[9],
+            email_verification_expires_at=row[10],
+        )
+
+    def get_user_by_email_verification_token_hash(self, token_hash: str) -> Optional[StoredAuthUser]:
+        normalized_hash = token_hash.strip()
+        if not normalized_hash:
+            return None
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT username, password_hash, role, tenant, scopes, name, email,
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
+                    FROM auth_users
+                    WHERE email_verification_token_hash = %s
+                    """,
+                    (normalized_hash,),
+                )
+                row = cur.fetchone()
+            conn.commit()
+
+        if row is None:
+            return None
+
+        return StoredAuthUser(
+            username=row[0],
+            password_hash=row[1],
+            role=row[2],
+            tenant=row[3],
+            scopes=list(row[4] or []),
+            name=row[5] or "",
+            email=row[6],
+            email_verified=bool(row[7]),
+            email_verified_at=row[8],
+            email_verification_token_hash=row[9],
+            email_verification_expires_at=row[10],
         )
 
     def list_users(self) -> List[StoredAuthUser]:
@@ -191,7 +370,8 @@ class PostgresAuthUserStore(AuthUserStore):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT username, password_hash, role, tenant, scopes
+                    SELECT username, password_hash, role, tenant, scopes, name, email,
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
                     FROM auth_users
                     ORDER BY username ASC
                     """
@@ -206,28 +386,64 @@ class PostgresAuthUserStore(AuthUserStore):
                 role=row[2],
                 tenant=row[3],
                 scopes=list(row[4] or []),
+                name=row[5] or "",
+                email=row[6],
+                email_verified=bool(row[7]),
+                email_verified_at=row[8],
+                email_verification_token_hash=row[9],
+                email_verification_expires_at=row[10],
             )
             for row in rows
         ]
 
     def upsert_user(self, user: StoredAuthUser) -> None:
-        with self._connect() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO auth_users (username, password_hash, role, tenant, scopes)
-                    VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (username)
-                    DO UPDATE SET
-                        password_hash = EXCLUDED.password_hash,
-                        role = EXCLUDED.role,
-                        tenant = EXCLUDED.tenant,
-                        scopes = EXCLUDED.scopes,
-                        updated_at = NOW()
-                    """,
-                    (user.username, user.password_hash, user.role, user.tenant, user.scopes),
+        try:
+            with self._connect() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO auth_users (
+                            username, password_hash, role, tenant, scopes,
+                            name, email, email_verified, email_verified_at,
+                            email_verification_token_hash, email_verification_expires_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (username)
+                        DO UPDATE SET
+                            password_hash = EXCLUDED.password_hash,
+                            role = EXCLUDED.role,
+                            tenant = EXCLUDED.tenant,
+                            scopes = EXCLUDED.scopes,
+                            name = EXCLUDED.name,
+                            email = EXCLUDED.email,
+                            email_verified = EXCLUDED.email_verified,
+                            email_verified_at = EXCLUDED.email_verified_at,
+                            email_verification_token_hash = EXCLUDED.email_verification_token_hash,
+                            email_verification_expires_at = EXCLUDED.email_verification_expires_at,
+                            updated_at = NOW()
+                        """,
+                        (
+                            user.username,
+                            user.password_hash,
+                            user.role,
+                            user.tenant,
+                            user.scopes,
+                            user.name,
+                            user.email,
+                            user.email_verified,
+                            user.email_verified_at,
+                            user.email_verification_token_hash,
+                            user.email_verification_expires_at,
+                        ),
+                    )
+                conn.commit()
+        except Exception as exc:
+            if getattr(exc, "sqlstate", "") == "23505":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Email already exists.",
                 )
-            conn.commit()
+            raise
 
     def delete_user(self, username: str) -> bool:
         with self._connect() as conn:
