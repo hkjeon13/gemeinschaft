@@ -10,12 +10,15 @@ import {
   addMessage,
   logout,
   getMe,
+  updateMe,
   hideConversation,
   updateConversationTitle,
   getConversationModelList,
   getConversationDefaultModel,
   setConversationDefaultModel,
   deleteConversationDefaultModel,
+  setConversationModelImage,
+  deleteConversationModelImage,
   getConversationRoomModels,
   addConversationRoomModel,
   removeConversationRoomModel,
@@ -65,6 +68,16 @@ interface ConversationModel {
   model_display_name: string;
   model_name: string;
   provider: string;
+  image_data_url?: string;
+}
+
+interface CurrentUserProfile {
+  sub: string;
+  role?: string;
+  name: string;
+  email?: string | null;
+  email_verified: boolean;
+  profile_image_data_url?: string | null;
 }
 
 // ─── 헬퍼 ────────────────────────────────────────────────────────────────────
@@ -105,6 +118,33 @@ function formatDate(iso: string) {
   return d.toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' });
 }
 
+const MAX_UPLOAD_BYTES = 512 * 1024;
+
+function readImageFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) {
+      reject(new Error('이미지 파일만 업로드할 수 있습니다.'));
+      return;
+    }
+    if (file.size > MAX_UPLOAD_BYTES) {
+      reject(new Error('이미지 파일은 512KB 이하만 업로드할 수 있습니다.'));
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      if (!result) {
+        reject(new Error('이미지 파일을 읽을 수 없습니다.'));
+        return;
+      }
+      resolve(result);
+    };
+    reader.onerror = () => reject(new Error('이미지 파일을 읽는 중 오류가 발생했습니다.'));
+    reader.readAsDataURL(file);
+  });
+}
+
 // ─── 아바타 ───────────────────────────────────────────────────────────────────
 
 const AVATAR_COLORS = [
@@ -131,6 +171,23 @@ function initialsOf(name: string) {
 function ModelAvatar({ model, size = 'md' }: { model: ConversationModel; size?: 'sm' | 'md' | 'lg' }) {
   const col = colorFor(model.model_id);
   const cls = size === 'sm' ? 'w-6 h-6 text-[9px]' : size === 'lg' ? 'w-10 h-10 text-sm' : 'w-8 h-8 text-xs';
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [model.image_data_url]);
+
+  if (model.image_data_url && !imageFailed) {
+    return (
+      <img
+        src={model.image_data_url}
+        alt={model.model_display_name}
+        onError={() => setImageFailed(true)}
+        className={`${cls} rounded-full object-cover flex-shrink-0 ring-2 ring-white/10 bg-white`}
+      />
+    );
+  }
+
   return (
     <div className={`${cls} rounded-full flex items-center justify-center flex-shrink-0 font-semibold select-none ring-2 ring-white/10`} style={{ background: col.bg, color: col.text }}>
       {initialsOf(model.model_display_name)}
@@ -303,7 +360,7 @@ function ManageModelsModal({
 }) {
   const [availableModels, setAvailableModels] = useState<Array<{
     model_id: string; provider: string; model: string;
-    display_name: string; is_active: boolean;
+    display_name: string; is_active: boolean; image_data_url?: string;
   }>>([]);
   const [loadingAvail, setLoadingAvail] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
@@ -322,6 +379,7 @@ function ManageModelsModal({
             display_name: m.display_name,
             // /conversation/model/list 는 이미 활성 모델만 반환
             is_active: true,
+            image_data_url: m.image_data_url,
           }))
         )
       )
@@ -384,7 +442,13 @@ function ManageModelsModal({
           {displayModels.length === 0 ? (
             <li className="px-5 py-8 text-center text-sm text-gray-400">참여한 모델이 없습니다</li>
           ) : displayModels.map((m) => {
-            const avatarModel: ConversationModel = { model_id: m.model_id, model_display_name: m.display_name, model_name: m.model, provider: m.provider };
+            const avatarModel: ConversationModel = {
+              model_id: m.model_id,
+              model_display_name: m.display_name,
+              model_name: m.model,
+              provider: m.provider,
+              image_data_url: m.image_data_url,
+            };
             const isRemoving = removing === m.model_id;
             return (
               <li key={m.model_id} className="flex items-center gap-3 px-5 py-3">
@@ -438,7 +502,13 @@ function ManageModelsModal({
                   <ul className="max-h-48 overflow-y-auto divide-y divide-gray-50 pb-2">
                     {addableModels.map((m) => {
                       const isAdding = adding === m.model_id;
-                      const avatarModel: ConversationModel = { model_id: m.model_id, model_display_name: m.display_name, model_name: m.model, provider: m.provider };
+                      const avatarModel: ConversationModel = {
+                        model_id: m.model_id,
+                        model_display_name: m.display_name,
+                        model_name: m.model,
+                        provider: m.provider,
+                        image_data_url: m.image_data_url,
+                      };
                       return (
                         <li key={m.model_id} className="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 transition-colors">
                           <ModelAvatar model={avatarModel} size="sm" />
@@ -475,6 +545,9 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [uploadTargetModelId, setUploadTargetModelId] = useState<string | null>(null);
+  const [imageBusyModelId, setImageBusyModelId] = useState<string | null>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     (async () => {
@@ -518,9 +591,70 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
     }
   };
 
+  const triggerUpload = (modelId: string) => {
+    setUploadTargetModelId(modelId);
+    imageInputRef.current?.click();
+  };
+
+  const handleImageFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const targetModelId = uploadTargetModelId;
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!targetModelId || !file) {
+      setUploadTargetModelId(null);
+      return;
+    }
+
+    setImageBusyModelId(targetModelId);
+    try {
+      const imageDataUrl = await readImageFileAsDataUrl(file);
+      const result = await setConversationModelImage(targetModelId, imageDataUrl);
+      setModels((prev) =>
+        prev.map((item) =>
+          item.model_id === targetModelId
+            ? { ...item, image_data_url: result.image_data_url }
+            : item
+        )
+      );
+    } catch (e) {
+      console.error(e);
+      const msg = e instanceof Error ? e.message : '모델 이미지 업로드에 실패했습니다.';
+      alert(msg);
+    } finally {
+      setImageBusyModelId(null);
+      setUploadTargetModelId(null);
+    }
+  };
+
+  const handleDeleteImage = async (modelId: string) => {
+    setImageBusyModelId(modelId);
+    try {
+      await deleteConversationModelImage(modelId);
+      setModels((prev) =>
+        prev.map((item) =>
+          item.model_id === modelId
+            ? { ...item, image_data_url: undefined }
+            : item
+        )
+      );
+    } catch (e) {
+      console.error(e);
+      alert('모델 이미지 삭제에 실패했습니다.');
+    } finally {
+      setImageBusyModelId(null);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md mx-4 overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        <input
+          ref={imageInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={handleImageFileChange}
+        />
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <div>
             <h3 className="font-semibold text-gray-900">기본 모델 설정</h3>
@@ -545,11 +679,27 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
             <p className="text-center text-sm text-gray-400 py-8">사용 가능한 모델이 없습니다</p>
           ) : models.map((m) => {
             const isSelected = selected === m.model_id;
+            const avatarModel: ConversationModel = {
+              model_id: m.model_id,
+              model_display_name: m.display_name,
+              model_name: m.model,
+              provider: m.provider,
+              image_data_url: m.image_data_url,
+            };
+            const imageBusy = imageBusyModelId === m.model_id;
             return (
-              <button
+              <div
                 key={m.model_id}
+                role="button"
+                tabIndex={0}
                 onClick={() => setSelected(isSelected ? null : m.model_id)}
-                className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-left transition-all border ${
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setSelected(isSelected ? null : m.model_id);
+                  }
+                }}
+                className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-left transition-all border cursor-pointer ${
                   isSelected ? 'bg-indigo-50 border-indigo-200' : 'bg-gray-50/60 border-transparent hover:bg-gray-100'
                 }`}
               >
@@ -558,6 +708,7 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
                 }`}>
                   {isSelected && <div className="w-1.5 h-1.5 bg-white rounded-full" />}
                 </div>
+                <ModelAvatar model={avatarModel} />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-sm font-medium text-gray-900">{m.display_name}</span>
@@ -568,7 +719,33 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
                   <p className="text-xs text-gray-400 mt-0.5 truncate">{m.model} · {m.provider}</p>
                   {m.description && <p className="text-xs text-gray-400 truncate mt-0.5">{m.description}</p>}
                 </div>
-              </button>
+                <div className="flex items-center gap-1.5 flex-shrink-0">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      triggerUpload(m.model_id);
+                    }}
+                    disabled={imageBusy}
+                    className="px-2 py-1 rounded-md text-[11px] text-indigo-600 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                    title="이미지 업로드"
+                  >
+                    {imageBusy ? '처리 중...' : m.image_data_url ? '변경' : '이미지'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDeleteImage(m.model_id);
+                    }}
+                    disabled={imageBusy || !m.image_data_url}
+                    className="px-2 py-1 rounded-md text-[11px] text-gray-500 bg-gray-100 hover:bg-gray-200 disabled:opacity-30 disabled:cursor-not-allowed"
+                    title="이미지 삭제"
+                  >
+                    삭제
+                  </button>
+                </div>
+              </div>
             );
           })}
         </div>
@@ -600,33 +777,185 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
 
 // ─── ProfileModal ─────────────────────────────────────────────────────────────
 
-function ProfileModal({ username, onClose }: { username: string; onClose: () => void }) {
+function ProfileModal({
+  username,
+  onClose,
+  onProfileUpdated,
+}: {
+  username: string;
+  onClose: () => void;
+  onProfileUpdated: (profile: CurrentUserProfile) => void;
+}) {
+  const [name, setName] = useState(username);
+  const [initialName, setInitialName] = useState(username);
+  const [email, setEmail] = useState<string | null>(null);
+  const [emailVerified, setEmailVerified] = useState(false);
+  const [profileImageDataUrl, setProfileImageDataUrl] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const syncFromMe = (me: CurrentUserProfile) => {
+    setName(me.name || me.sub);
+    setInitialName(me.name || me.sub);
+    setEmail(me.email ?? null);
+    setEmailVerified(!!me.email_verified);
+    setProfileImageDataUrl(me.profile_image_data_url ?? null);
+    onProfileUpdated(me);
+  };
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const me = await getMe();
+        syncFromMe(me);
+      } catch (e) {
+        console.error(e);
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, []);
+
+  const handleSaveName = async () => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      alert('이름을 입력해주세요.');
+      return;
+    }
+    if (trimmed === initialName.trim()) {
+      onClose();
+      return;
+    }
+    setSaving(true);
+    try {
+      const me = await updateMe({ name: trimmed });
+      syncFromMe(me);
+      onClose();
+    } catch (e) {
+      console.error(e);
+      alert('프로필 저장에 실패했습니다.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleUploadImage = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    setSaving(true);
+    try {
+      const imageDataUrl = await readImageFileAsDataUrl(file);
+      const me = await updateMe({ profile_image_data_url: imageDataUrl });
+      syncFromMe(me);
+    } catch (e) {
+      console.error(e);
+      const msg = e instanceof Error ? e.message : '프로필 이미지 업로드에 실패했습니다.';
+      alert(msg);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleRemoveImage = async () => {
+    setSaving(true);
+    try {
+      const me = await updateMe({ clear_profile_image: true });
+      syncFromMe(me);
+    } catch (e) {
+      console.error(e);
+      alert('프로필 이미지 삭제에 실패했습니다.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden" onClick={(e) => e.stopPropagation()}>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          className="hidden"
+          onChange={handleUploadImage}
+        />
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-100">
           <h3 className="font-semibold text-gray-900">프로필 설정</h3>
           <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-full text-gray-400 hover:text-gray-600 hover:bg-gray-100 transition-colors">
             <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4"><path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" /></svg>
           </button>
         </div>
-        <div className="px-5 py-6 flex flex-col items-center gap-4">
-          <div className="w-16 h-16 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center">
-            <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8">
-              <path fillRule="evenodd" d="M7.5 6a4.5 4.5 0 1 1 9 0 4.5 4.5 0 0 1-9 0ZM3.751 20.105a8.25 8.25 0 0 1 16.498 0 .75.75 0 0 1-.437.695A18.683 18.683 0 0 1 12 22.5c-2.786 0-5.433-.608-7.812-1.7a.75.75 0 0 1-.437-.695Z" clipRule="evenodd" />
-            </svg>
+        {loading ? (
+          <div className="py-10 flex items-center justify-center">
+            <div className="w-5 h-5 border-2 border-gray-200 border-t-indigo-500 rounded-full animate-spin" />
           </div>
-          <div className="text-center">
-            <p className="font-semibold text-gray-900">{username}</p>
-            <p className="text-xs text-gray-400 mt-1">계정 ID</p>
-          </div>
-          <div className="w-full bg-gray-50 rounded-xl px-4 py-3 text-sm text-gray-500 text-center">
-            프로필 수정 기능은 준비 중입니다.
-          </div>
-        </div>
-        <div className="px-5 pb-5">
-          <button onClick={onClose} className="w-full py-2.5 text-sm font-medium text-white rounded-xl" style={{ background: '#4f46e5' }}>닫기</button>
-        </div>
+        ) : (
+          <>
+            <div className="px-5 py-5 flex flex-col items-center gap-4">
+              {profileImageDataUrl ? (
+                <img src={profileImageDataUrl} alt={name} className="w-16 h-16 rounded-full object-cover border border-gray-200" />
+              ) : (
+                <div className="w-16 h-16 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center">
+                  <svg viewBox="0 0 24 24" fill="white" className="w-8 h-8">
+                    <path fillRule="evenodd" d="M7.5 6a4.5 4.5 0 1 1 9 0 4.5 4.5 0 0 1-9 0ZM3.751 20.105a8.25 8.25 0 0 1 16.498 0 .75.75 0 0 1-.437.695A18.683 18.683 0 0 1 12 22.5c-2.786 0-5.433-.608-7.812-1.7a.75.75 0 0 1-.437-.695Z" clipRule="evenodd" />
+                  </svg>
+                </div>
+              )}
+
+              <div className="w-full space-y-3">
+                <div>
+                  <label className="block text-xs text-gray-500 mb-1">이름</label>
+                  <input
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    maxLength={100}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                  />
+                </div>
+                <div className="text-xs text-gray-400">
+                  <p>계정: {username}</p>
+                  {email && <p className="mt-1">이메일: {email} {emailVerified ? '(인증됨)' : '(미인증)'}</p>}
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={saving}
+                    className="flex-1 px-3 py-2 text-xs rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    이미지 업로드
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRemoveImage}
+                    disabled={saving || !profileImageDataUrl}
+                    className="px-3 py-2 text-xs rounded-lg bg-gray-100 text-gray-600 hover:bg-gray-200 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    이미지 삭제
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div className="px-5 pb-5 flex gap-2">
+              <button
+                onClick={onClose}
+                className="flex-1 py-2.5 text-sm font-medium text-gray-600 rounded-xl border border-gray-200 hover:bg-gray-50"
+              >
+                취소
+              </button>
+              <button
+                onClick={handleSaveName}
+                disabled={saving}
+                className="flex-1 py-2.5 text-sm font-medium text-white rounded-xl disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ background: '#4f46e5' }}
+              >
+                {saving ? '저장 중...' : '저장'}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -634,7 +963,15 @@ function ProfileModal({ username, onClose }: { username: string; onClose: () => 
 
 // ─── UserMenuButton ───────────────────────────────────────────────────────────
 
-function UserMenuButton({ username, onLogout }: { username: string; onLogout: () => void }) {
+function UserMenuButton({
+  username,
+  onLogout,
+  onProfileUpdated,
+}: {
+  username: string;
+  onLogout: () => void;
+  onProfileUpdated: (profile: CurrentUserProfile) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [showDefaultModel, setShowDefaultModel] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
@@ -709,7 +1046,11 @@ function UserMenuButton({ username, onLogout }: { username: string; onLogout: ()
         document.body
       )}
       {showProfile && canPortal && createPortal(
-        <ProfileModal username={username} onClose={() => setShowProfile(false)} />,
+        <ProfileModal
+          username={username}
+          onClose={() => setShowProfile(false)}
+          onProfileUpdated={onProfileUpdated}
+        />,
         document.body
       )}
     </>
@@ -762,6 +1103,7 @@ function ConversationHeader({
     model_display_name: m.display_name,
     model_name: m.model,
     provider: m.provider,
+    image_data_url: m.image_data_url,
   });
 
   return (
@@ -954,6 +1296,8 @@ export function ChatPage() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const [currentUser, setCurrentUser] = useState<string>('');
+  const [currentUserName, setCurrentUserName] = useState<string>('');
+  const [currentUserProfileImage, setCurrentUserProfileImage] = useState<string | null>(null);
   const [currentUserRole, setCurrentUserRole] = useState<string>('');
   const [conversations, setConversations] = useState<ConversationListItem[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
@@ -993,12 +1337,16 @@ export function ChatPage() {
   const loadInitialData = async () => {
     setLoading(true);
     try {
-      const meData = await getMe() as { sub: string; role?: string };
+      const meData = await getMe();
       setCurrentUser(meData.sub);
+      setCurrentUserName(meData.name || meData.sub);
+      setCurrentUserProfileImage(meData.profile_image_data_url ?? null);
       setCurrentUserRole(meData.role ?? '');
       setConversations(await getConversationList());
     } catch {
       setCurrentUser('');
+      setCurrentUserName('');
+      setCurrentUserProfileImage(null);
       setCurrentUserRole('');
       setConversations([]);
       setCurrentConversation(null);
@@ -1099,6 +1447,7 @@ export function ChatPage() {
         model_display_name: picked.display_name,
         model_name: picked.model,
         provider: picked.provider,
+        image_data_url: picked.image_data_url,
       };
     }
 
@@ -1171,11 +1520,20 @@ export function ChatPage() {
     try { await logout(); } catch { /* ignore */ }
     // 로그아웃 후에는 채팅 화면만 유지하고, 채팅 액션 시 로그인 유도
     setCurrentUser('');
+    setCurrentUserName('');
+    setCurrentUserProfileImage(null);
     setCurrentUserRole('');
     setConversations([]);
     setCurrentConversation(null);
     setSelectedConversationId(null);
     setShowLoginModal(false);
+  };
+
+  const handleProfileUpdated = (profile: CurrentUserProfile) => {
+    setCurrentUser(profile.sub);
+    setCurrentUserName(profile.name || profile.sub);
+    setCurrentUserProfileImage(profile.profile_image_data_url ?? null);
+    setCurrentUserRole(profile.role ?? '');
   };
 
   const handleStartContinue = async (settings: ContinueSettings) => {
@@ -1225,7 +1583,15 @@ export function ChatPage() {
     setIsContinuing(false);
   };
 
-  const conversationModels = currentConversation ? extractModels(currentConversation.messages) : [];
+  const roomModelImageMap = new Map(
+    (Array.isArray(roomModels) ? roomModels : []).map((model) => [model.model_id, model.image_data_url])
+  );
+  const conversationModels = currentConversation
+    ? extractModels(currentConversation.messages).map((model) => ({
+      ...model,
+      image_data_url: roomModelImageMap.get(model.model_id),
+    }))
+    : [];
   // 타이핑 인디케이터: pendingModel(랜덤 선택된 모델) 우선, 없으면 마지막 대화 모델
   const typingModel = pendingModel ?? (conversationModels.length > 0 ? conversationModels[conversationModels.length - 1] : null);
   const selectedConv = conversations.find((c) => c.conversation_id === selectedConversationId);
@@ -1437,15 +1803,27 @@ export function ChatPage() {
           )}
           {currentUser ? (
             <div className="flex items-center gap-2.5">
-              <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center flex-shrink-0">
-                <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
-                  <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM12.735 14c.618 0 1.093-.561.872-1.139a6.002 6.002 0 0 0-11.215 0c-.22.578.254 1.139.872 1.139h9.47Z" />
-                </svg>
-              </div>
+              {currentUserProfileImage ? (
+                <img
+                  src={currentUserProfileImage}
+                  alt={currentUserName || currentUser}
+                  className="w-7 h-7 rounded-full object-cover border border-gray-200 flex-shrink-0"
+                />
+              ) : (
+                <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-400 to-purple-500 flex items-center justify-center flex-shrink-0">
+                  <svg viewBox="0 0 16 16" fill="white" className="w-3.5 h-3.5">
+                    <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6ZM12.735 14c.618 0 1.093-.561.872-1.139a6.002 6.002 0 0 0-11.215 0c-.22.578.254 1.139.872 1.139h9.47Z" />
+                  </svg>
+                </div>
+              )}
               <span className="text-xs truncate flex-1 font-medium text-gray-500">
-                {currentUser}
+                {currentUserName || currentUser}
               </span>
-              <UserMenuButton username={currentUser} onLogout={handleLogout} />
+              <UserMenuButton
+                username={currentUser}
+                onLogout={handleLogout}
+                onProfileUpdated={handleProfileUpdated}
+              />
             </div>
           ) : (
             <button
@@ -1518,6 +1896,7 @@ export function ChatPage() {
                           model_display_name: msg.model_display_name ?? msg.model_name ?? msg.model_id ?? 'Assistant',
                           model_name: msg.model_name ?? '',
                           provider: msg.provider ?? '',
+                          image_data_url: msg.model_id ? roomModelImageMap.get(msg.model_id) : undefined,
                         }
                       : undefined;
 

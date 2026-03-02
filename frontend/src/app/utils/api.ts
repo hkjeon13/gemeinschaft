@@ -231,7 +231,45 @@ export async function register(data: {
 
 // 내 세션 조회
 export async function getMe() {
-  return apiRequest('/auth/me');
+  return apiRequest<{
+    sub: string;
+    role?: string;
+    tenant: string;
+    scope: string;
+    iss?: string;
+    aud?: string;
+    typ?: string;
+    exp: number;
+    name: string;
+    email?: string | null;
+    email_verified: boolean;
+    profile_image_data_url?: string | null;
+  }>('/auth/me');
+}
+
+// 내 프로필 수정
+export async function updateMe(data: {
+  name?: string;
+  profile_image_data_url?: string;
+  clear_profile_image?: boolean;
+}) {
+  return apiRequest<{
+    sub: string;
+    role?: string;
+    tenant: string;
+    scope: string;
+    iss?: string;
+    aud?: string;
+    typ?: string;
+    exp: number;
+    name: string;
+    email?: string | null;
+    email_verified: boolean;
+    profile_image_data_url?: string | null;
+  }>('/auth/me', {
+    method: 'PATCH',
+    body: JSON.stringify(data),
+  });
 }
 
 // 사용자 목록 조회
@@ -296,6 +334,7 @@ export interface ConversationModelOption {
   description?: string;
   is_global_default: boolean;
   is_user_default: boolean;
+  image_data_url?: string;
 }
 
 export async function getConversationModelList() {
@@ -315,6 +354,19 @@ export async function setConversationDefaultModel(model_id: string) {
 
 export async function deleteConversationDefaultModel() {
   return apiRequest<{ model_id: string; display_name: string; source: string }>('/conversation/model/default', {
+    method: 'DELETE',
+  });
+}
+
+export async function setConversationModelImage(modelId: string, imageDataUrl: string) {
+  return apiRequest<{ model_id: string; image_data_url: string }>(`/conversation/model/${modelId}/image`, {
+    method: 'PUT',
+    body: JSON.stringify({ image_data_url: imageDataUrl }),
+  });
+}
+
+export async function deleteConversationModelImage(modelId: string) {
+  return apiRequest<void>(`/conversation/model/${modelId}/image`, {
     method: 'DELETE',
   });
 }
@@ -363,6 +415,7 @@ export interface ConversationRoomModel {
   model: string;
   provider: string;
   openai_api?: string;
+  image_data_url?: string;
 }
 
 /** 대화방에 설정된 모델 리스트 조회 (없으면 사용자 기본 모델 1개로 자동 초기화) */

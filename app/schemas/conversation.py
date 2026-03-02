@@ -132,6 +132,7 @@ class ConversationModelOptionSchema(BaseModel):
     description: str
     is_global_default: bool
     is_user_default: bool
+    image_data_url: Optional[str] = None
 
 
 class UserDefaultModelSchema(BaseModel):
@@ -151,6 +152,7 @@ class ConversationAssignedModelSchema(BaseModel):
     model: str
     display_name: str
     description: str
+    image_data_url: Optional[str] = None
 
 
 class ConversationAssignedModelListSchema(BaseModel):
@@ -160,3 +162,12 @@ class ConversationAssignedModelListSchema(BaseModel):
 
 class ConversationAssignedModelUpdateSchema(BaseModel):
     model_id: str = Field(..., min_length=1)
+
+
+class ConversationModelImageUpdateSchema(BaseModel):
+    image_data_url: str = Field(..., min_length=1)
+
+
+class ConversationModelImageSchema(BaseModel):
+    model_id: str
+    image_data_url: str

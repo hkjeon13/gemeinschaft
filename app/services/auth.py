@@ -20,6 +20,7 @@ from jwt import ExpiredSignatureError, InvalidTokenError
 
 from .auth_user_store import StoredAuthUser, get_auth_user_store, initialize_auth_user_store
 from .email_delivery import send_verification_email
+from .image_data_url import normalize_image_data_url_or_raise
 from .request_security import (
     auth_require_dpop,
     csrf_cookie_name,
@@ -53,6 +54,7 @@ class AuthUser:
     name: str = ""
     email: Optional[str] = None
     email_verified: bool = False
+    profile_image_data_url: Optional[str] = None
 
 
 @dataclass
@@ -65,6 +67,7 @@ class AuthUserRecord:
     name: str
     email: Optional[str]
     email_verified: bool
+    profile_image_data_url: Optional[str] = None
 
 
 @dataclass
@@ -434,6 +437,23 @@ def _email_verification_expires_minutes() -> int:
     return value
 
 
+def _profile_image_max_bytes() -> int:
+    raw = os.getenv("AUTH_PROFILE_IMAGE_MAX_BYTES", "524288").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_PROFILE_IMAGE_MAX_BYTES must be an integer.",
+        )
+    if value <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AUTH_PROFILE_IMAGE_MAX_BYTES must be greater than 0.",
+        )
+    return value
+
+
 def _require_verified_email_for_login() -> bool:
     raw = os.getenv("AUTH_REQUIRE_VERIFIED_EMAIL_FOR_LOGIN", "true").strip().lower()
     return raw in ("1", "true", "yes", "y")
@@ -530,6 +550,7 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
         name = username
         email: Optional[str] = None
         email_verified = False
+        profile_image_data_url: Optional[str] = None
         password_hash: Optional[str] = None
         plain_password: Optional[str] = None
 
@@ -550,6 +571,15 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
                         detail=f"AUTH user '{username}' email is invalid.",
                     ) from exc
             email_verified = bool(config.get("email_verified", False))
+            raw_profile_image = config.get("profile_image_data_url")
+            if raw_profile_image is not None:
+                try:
+                    profile_image_data_url = _normalize_profile_image_data_url_or_raise(str(raw_profile_image))
+                except HTTPException as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"AUTH user '{username}' profile_image_data_url is invalid.",
+                    ) from exc
             password_hash = config.get("password_hash")
             plain_password = config.get("password")
         else:
@@ -591,6 +621,7 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
                 name=name.strip(),
                 email=email,
                 email_verified=email_verified,
+                profile_image_data_url=profile_image_data_url,
             )
             continue
 
@@ -617,6 +648,7 @@ def _load_auth_users() -> Dict[str, AuthUserRecord]:
                 name=name.strip(),
                 email=email,
                 email_verified=email_verified,
+                profile_image_data_url=profile_image_data_url,
             )
             continue
 
@@ -657,6 +689,7 @@ def _seed_users_for_store(seed_config: Dict[str, AuthUserRecord]) -> Dict[str, S
             email_verified_at=datetime.now(timezone.utc) if config.email_verified else None,
             email_verification_token_hash=None,
             email_verification_expires_at=None,
+            profile_image_data_url=config.profile_image_data_url,
         )
     return seeded
 
@@ -678,6 +711,7 @@ def authenticate_user(username: str, password: str) -> Optional[AuthUser]:
         name=user.name,
         email=user.email,
         email_verified=user.email_verified,
+        profile_image_data_url=user.profile_image_data_url,
     )
 
 
@@ -726,6 +760,14 @@ def _normalize_email_or_raise(email: str) -> str:
     return normalized
 
 
+def _normalize_profile_image_data_url_or_raise(image_data_url: str) -> str:
+    return normalize_image_data_url_or_raise(
+        field_name="profile_image_data_url",
+        value=image_data_url,
+        max_bytes=_profile_image_max_bytes(),
+    )
+
+
 def _normalize_role_or_raise(role: str) -> str:
     normalized = role.strip()
     if not normalized:
@@ -767,6 +809,7 @@ def list_auth_users() -> List[AuthUser]:
             name=user.name,
             email=user.email,
             email_verified=user.email_verified,
+            profile_image_data_url=user.profile_image_data_url,
         )
         for user in users
     ]
@@ -785,6 +828,7 @@ def get_auth_user(username: str) -> Optional[AuthUser]:
         name=user.name,
         email=user.email,
         email_verified=user.email_verified,
+        profile_image_data_url=user.profile_image_data_url,
     )
 
 
@@ -812,6 +856,7 @@ def create_auth_user(username: str, password: str, role: str, tenant: str, scope
         email_verified_at=None,
         email_verification_token_hash=None,
         email_verification_expires_at=None,
+        profile_image_data_url=None,
     )
     get_auth_user_store().upsert_user(stored)
 
@@ -831,6 +876,7 @@ def create_auth_user(username: str, password: str, role: str, tenant: str, scope
         name=stored.name,
         email=stored.email,
         email_verified=stored.email_verified,
+        profile_image_data_url=stored.profile_image_data_url,
     )
 
 
@@ -868,6 +914,7 @@ def update_auth_user(
         email_verified_at=existing.email_verified_at,
         email_verification_token_hash=existing.email_verification_token_hash,
         email_verification_expires_at=existing.email_verification_expires_at,
+        profile_image_data_url=existing.profile_image_data_url,
     )
 
     get_auth_user_store().upsert_user(updated)
@@ -887,6 +934,73 @@ def update_auth_user(
         name=updated.name,
         email=updated.email,
         email_verified=updated.email_verified,
+        profile_image_data_url=updated.profile_image_data_url,
+    )
+
+
+def update_auth_user_profile(
+    *,
+    username: str,
+    name: Optional[str] = None,
+    profile_image_data_url: Optional[str] = None,
+    clear_profile_image: bool = False,
+) -> AuthUser:
+    if name is None and profile_image_data_url is None and not clear_profile_image:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one field must be provided.",
+        )
+    if profile_image_data_url is not None and clear_profile_image:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="profile_image_data_url and clear_profile_image cannot be used together.",
+        )
+
+    normalized_username = _normalize_username_or_raise(username)
+    existing = get_auth_user_store().get_user(normalized_username)
+    if existing is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found.",
+        )
+
+    next_name = existing.name if name is None else _normalize_name_or_raise(name)
+    next_profile_image_data_url = existing.profile_image_data_url
+    if clear_profile_image:
+        next_profile_image_data_url = None
+    elif profile_image_data_url is not None:
+        next_profile_image_data_url = _normalize_profile_image_data_url_or_raise(profile_image_data_url)
+
+    updated = StoredAuthUser(
+        username=existing.username,
+        password_hash=existing.password_hash,
+        role=existing.role,
+        tenant=existing.tenant,
+        scopes=list(existing.scopes),
+        name=next_name,
+        email=existing.email,
+        email_verified=existing.email_verified,
+        email_verified_at=existing.email_verified_at,
+        email_verification_token_hash=existing.email_verification_token_hash,
+        email_verification_expires_at=existing.email_verification_expires_at,
+        profile_image_data_url=next_profile_image_data_url,
+    )
+    get_auth_user_store().upsert_user(updated)
+    emit_security_event(
+        event_type="user_profile_updated",
+        outcome="allow",
+        target_user=updated.username,
+        tenant=updated.tenant,
+    )
+    return AuthUser(
+        username=updated.username,
+        role=updated.role,
+        tenant=updated.tenant,
+        scopes=list(updated.scopes),
+        name=updated.name,
+        email=updated.email,
+        email_verified=updated.email_verified,
+        profile_image_data_url=updated.profile_image_data_url,
     )
 
 
@@ -1015,6 +1129,7 @@ def register_auth_user(
         email_verified_at=verified_at,
         email_verification_token_hash=token_hash,
         email_verification_expires_at=token_expires_at,
+        profile_image_data_url=None,
     )
     store.upsert_user(stored)
 
@@ -1047,6 +1162,7 @@ def register_auth_user(
         name=stored.name,
         email=stored.email,
         email_verified=stored.email_verified,
+        profile_image_data_url=stored.profile_image_data_url,
     )
 
 
@@ -1074,6 +1190,7 @@ def resend_verification_email(*, email: str, request: Request) -> None:
         email_verified_at=None,
         email_verification_token_hash=token_hash,
         email_verification_expires_at=token_expires_at,
+        profile_image_data_url=user.profile_image_data_url,
     )
     store.upsert_user(updated)
     _send_verification_email_or_raise(
@@ -1122,6 +1239,7 @@ def verify_email_token(token: str) -> AuthUser:
             email_verified_at=None,
             email_verification_token_hash=None,
             email_verification_expires_at=None,
+            profile_image_data_url=user.profile_image_data_url,
         )
         store.upsert_user(expired)
         raise HTTPException(
@@ -1141,6 +1259,7 @@ def verify_email_token(token: str) -> AuthUser:
         email_verified_at=now,
         email_verification_token_hash=None,
         email_verification_expires_at=None,
+        profile_image_data_url=user.profile_image_data_url,
     )
     store.upsert_user(verified)
     emit_security_event(
@@ -1157,6 +1276,7 @@ def verify_email_token(token: str) -> AuthUser:
         name=verified.name,
         email=verified.email,
         email_verified=True,
+        profile_image_data_url=verified.profile_image_data_url,
     )
 
 
@@ -1657,6 +1777,7 @@ def validate_auth_settings() -> None:
     csrf_cookie_name()
     _signup_default_role()
     _email_verification_expires_minutes()
+    _profile_image_max_bytes()
 
     login_rate_limit_settings()
     validate_security_state_settings()

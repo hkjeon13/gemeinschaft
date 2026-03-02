@@ -27,6 +27,7 @@ class StoredAuthUser:
     email_verified_at: Optional[datetime] = None
     email_verification_token_hash: Optional[str] = None
     email_verification_expires_at: Optional[datetime] = None
+    profile_image_data_url: Optional[str] = None
 
 
 class AuthUserStore:
@@ -98,6 +99,7 @@ class InMemoryAuthUserStore(AuthUserStore):
                 email_verified_at=user.email_verified_at,
                 email_verification_token_hash=user.email_verification_token_hash,
                 email_verification_expires_at=user.email_verification_expires_at,
+                profile_image_data_url=user.profile_image_data_url,
             )
 
     def get_user_by_email(self, email: str) -> Optional[StoredAuthUser]:
@@ -119,6 +121,7 @@ class InMemoryAuthUserStore(AuthUserStore):
                         email_verified_at=user.email_verified_at,
                         email_verification_token_hash=user.email_verification_token_hash,
                         email_verification_expires_at=user.email_verification_expires_at,
+                        profile_image_data_url=user.profile_image_data_url,
                     )
         return None
 
@@ -141,6 +144,7 @@ class InMemoryAuthUserStore(AuthUserStore):
                         email_verified_at=user.email_verified_at,
                         email_verification_token_hash=user.email_verification_token_hash,
                         email_verification_expires_at=user.email_verification_expires_at,
+                        profile_image_data_url=user.profile_image_data_url,
                     )
         return None
 
@@ -162,6 +166,7 @@ class InMemoryAuthUserStore(AuthUserStore):
                 email_verified_at=user.email_verified_at,
                 email_verification_token_hash=user.email_verification_token_hash,
                 email_verification_expires_at=user.email_verification_expires_at,
+                profile_image_data_url=user.profile_image_data_url,
             )
             for user in users
         ]
@@ -180,6 +185,7 @@ class InMemoryAuthUserStore(AuthUserStore):
                 email_verified_at=user.email_verified_at,
                 email_verification_token_hash=user.email_verification_token_hash,
                 email_verification_expires_at=user.email_verification_expires_at,
+                profile_image_data_url=user.profile_image_data_url,
             )
 
     def delete_user(self, username: str) -> bool:
@@ -225,6 +231,7 @@ class PostgresAuthUserStore(AuthUserStore):
             email_verified_at TIMESTAMPTZ,
             email_verification_token_hash TEXT,
             email_verification_expires_at TIMESTAMPTZ,
+            profile_image_data_url TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
@@ -236,6 +243,7 @@ class PostgresAuthUserStore(AuthUserStore):
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verification_token_hash TEXT;
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verification_expires_at TIMESTAMPTZ;
+        ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS profile_image_data_url TEXT;
         """
         index_sql = """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_unique
@@ -266,7 +274,8 @@ class PostgresAuthUserStore(AuthUserStore):
                 cur.execute(
                     """
                     SELECT username, password_hash, role, tenant, scopes, name, email,
-                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at,
+                           profile_image_data_url
                     FROM auth_users
                     WHERE username = %s
                     """,
@@ -290,6 +299,7 @@ class PostgresAuthUserStore(AuthUserStore):
             email_verified_at=row[8],
             email_verification_token_hash=row[9],
             email_verification_expires_at=row[10],
+            profile_image_data_url=row[11],
         )
 
     def get_user_by_email(self, email: str) -> Optional[StoredAuthUser]:
@@ -301,7 +311,8 @@ class PostgresAuthUserStore(AuthUserStore):
                 cur.execute(
                     """
                     SELECT username, password_hash, role, tenant, scopes, name, email,
-                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at,
+                           profile_image_data_url
                     FROM auth_users
                     WHERE email = %s
                     """,
@@ -325,6 +336,7 @@ class PostgresAuthUserStore(AuthUserStore):
             email_verified_at=row[8],
             email_verification_token_hash=row[9],
             email_verification_expires_at=row[10],
+            profile_image_data_url=row[11],
         )
 
     def get_user_by_email_verification_token_hash(self, token_hash: str) -> Optional[StoredAuthUser]:
@@ -336,7 +348,8 @@ class PostgresAuthUserStore(AuthUserStore):
                 cur.execute(
                     """
                     SELECT username, password_hash, role, tenant, scopes, name, email,
-                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at,
+                           profile_image_data_url
                     FROM auth_users
                     WHERE email_verification_token_hash = %s
                     """,
@@ -360,6 +373,7 @@ class PostgresAuthUserStore(AuthUserStore):
             email_verified_at=row[8],
             email_verification_token_hash=row[9],
             email_verification_expires_at=row[10],
+            profile_image_data_url=row[11],
         )
 
     def list_users(self) -> List[StoredAuthUser]:
@@ -368,7 +382,8 @@ class PostgresAuthUserStore(AuthUserStore):
                 cur.execute(
                     """
                     SELECT username, password_hash, role, tenant, scopes, name, email,
-                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at
+                           email_verified, email_verified_at, email_verification_token_hash, email_verification_expires_at,
+                           profile_image_data_url
                     FROM auth_users
                     ORDER BY username ASC
                     """
@@ -389,6 +404,7 @@ class PostgresAuthUserStore(AuthUserStore):
                 email_verified_at=row[8],
                 email_verification_token_hash=row[9],
                 email_verification_expires_at=row[10],
+                profile_image_data_url=row[11],
             )
             for row in rows
         ]
@@ -402,9 +418,10 @@ class PostgresAuthUserStore(AuthUserStore):
                         INSERT INTO auth_users (
                             username, password_hash, role, tenant, scopes,
                             name, email, email_verified, email_verified_at,
-                            email_verification_token_hash, email_verification_expires_at
+                            email_verification_token_hash, email_verification_expires_at,
+                            profile_image_data_url
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         ON CONFLICT (username)
                         DO UPDATE SET
                             password_hash = EXCLUDED.password_hash,
@@ -417,6 +434,7 @@ class PostgresAuthUserStore(AuthUserStore):
                             email_verified_at = EXCLUDED.email_verified_at,
                             email_verification_token_hash = EXCLUDED.email_verification_token_hash,
                             email_verification_expires_at = EXCLUDED.email_verification_expires_at,
+                            profile_image_data_url = EXCLUDED.profile_image_data_url,
                             updated_at = NOW()
                         """,
                         (
@@ -431,6 +449,7 @@ class PostgresAuthUserStore(AuthUserStore):
                             user.email_verified_at,
                             user.email_verification_token_hash,
                             user.email_verification_expires_at,
+                            user.profile_image_data_url,
                         ),
                     )
                 conn.commit()

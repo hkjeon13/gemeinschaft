@@ -45,3 +45,24 @@ class AuthSessionResponseSchema(BaseModel):
     access_expires_in: int
     refresh_expires_in: int
     csrf_token: str
+
+
+class AuthMeResponseSchema(BaseModel):
+    sub: str
+    role: Optional[str] = None
+    tenant: str
+    scope: str
+    iss: Optional[str] = None
+    aud: Optional[str] = None
+    typ: Optional[str] = None
+    exp: int
+    name: str = ""
+    email: Optional[str] = None
+    email_verified: bool = False
+    profile_image_data_url: Optional[str] = None
+
+
+class AuthProfileUpdateRequestSchema(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    profile_image_data_url: Optional[str] = Field(default=None, min_length=1)
+    clear_profile_image: bool = Field(default=False)

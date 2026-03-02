@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
 
 from app.schemas.auth import (
+    AuthMeResponseSchema,
+    AuthProfileUpdateRequestSchema,
     AuthSessionResponseSchema,
     LoginRequestSchema,
     RegisterRequestSchema,
@@ -24,6 +26,7 @@ from app.services.auth import (
     decode_and_validate_jwt,
     dpop_jkt_from_claims,
     ensure_user_can_login,
+    get_auth_user,
     ensure_login_not_rate_limited,
     get_jwks_document,
     invalidate_refresh_token,
@@ -35,6 +38,7 @@ from app.services.auth import (
     resend_verification_email,
     rotate_token_pair_from_refresh_token,
     require_jwt,
+    update_auth_user_profile,
     verify_email_token,
 )
 from app.services.request_security import enforce_origin_for_state_change, validate_dpop_proof
@@ -62,6 +66,50 @@ def _verify_result_redirect_url(result: str, message: str) -> str:
         ]
     )
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query_items), parsed.fragment))
+
+
+def _me_response(jwt_ctx: JwtContext) -> AuthMeResponseSchema:
+    claims = jwt_ctx.claims
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid JWT subject.",
+        )
+
+    role = claims.get("role")
+    tenant = claims.get("tenant")
+    if not isinstance(tenant, str) or not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid JWT tenant.",
+        )
+
+    scope = claims.get("scope")
+    scope_value = scope if isinstance(scope, str) else ""
+
+    exp = claims.get("exp")
+    if not isinstance(exp, int):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid JWT expiration.",
+        )
+
+    user = get_auth_user(sub)
+    return AuthMeResponseSchema(
+        sub=sub,
+        role=role if isinstance(role, str) else None,
+        tenant=tenant,
+        scope=scope_value,
+        iss=claims.get("iss") if isinstance(claims.get("iss"), str) else None,
+        aud=claims.get("aud") if isinstance(claims.get("aud"), str) else None,
+        typ=claims.get("typ") if isinstance(claims.get("typ"), str) else None,
+        exp=exp,
+        name=user.name if user else sub,
+        email=user.email if user else None,
+        email_verified=bool(user.email_verified) if user else False,
+        profile_image_data_url=user.profile_image_data_url if user else None,
+    )
 
 
 @auth_router.post("/login", response_model=AuthSessionResponseSchema)
@@ -188,16 +236,28 @@ async def jwks():
     return get_jwks_document()
 
 
-@auth_router.get("/me")
+@auth_router.get("/me", response_model=AuthMeResponseSchema)
 async def me(jwt_ctx: JwtContext = Depends(require_jwt)):
-    claims = jwt_ctx.claims
-    return {
-        "sub": claims.get("sub"),
-        "role": claims.get("role"),
-        "tenant": claims.get("tenant"),
-        "scope": claims.get("scope"),
-        "iss": claims.get("iss"),
-        "aud": claims.get("aud"),
-        "typ": claims.get("typ"),
-        "exp": claims.get("exp"),
-    }
+    return _me_response(jwt_ctx)
+
+
+@auth_router.patch("/me", response_model=AuthMeResponseSchema)
+async def update_me(
+    payload: AuthProfileUpdateRequestSchema,
+    request: Request,
+    jwt_ctx: JwtContext = Depends(require_jwt),
+):
+    enforce_origin_for_state_change(request)
+    sub = jwt_ctx.claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid JWT subject.",
+        )
+    update_auth_user_profile(
+        username=sub,
+        name=payload.name,
+        profile_image_data_url=payload.profile_image_data_url,
+        clear_profile_image=payload.clear_profile_image,
+    )
+    return _me_response(jwt_ctx)

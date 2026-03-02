@@ -14,6 +14,8 @@ from app.schemas.conversation import (
     ConversationDetailSchema,
     ConversationAssignedModelListSchema,
     ConversationAssignedModelSchema,
+    ConversationModelImageSchema,
+    ConversationModelImageUpdateSchema,
     ConversationAssignedModelUpdateSchema,
     ConversationModelOptionSchema,
     ConversationSummarySchema,
@@ -25,6 +27,7 @@ from app.schemas.conversation import (
     UserDefaultModelSchema,
     UserDefaultModelUpdateSchema,
 )
+from app.services.image_data_url import normalize_image_data_url_or_raise
 from app.services.async_openai_chat_model import AsyncOpenAIChatModel
 from app.services.authorization import AccessContext, authorize_action, require_access_context
 from app.services.chat_model_registry import (
@@ -67,6 +70,23 @@ _TOPIC_SHIFT_SUGGESTIONS = (
 
 def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
     return is_active and provider == "openai"
+
+
+def _conversation_model_image_max_bytes() -> int:
+    raw = os.getenv("CONVERSATION_MODEL_IMAGE_MAX_BYTES", "262144").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="CONVERSATION_MODEL_IMAGE_MAX_BYTES must be an integer.",
+        )
+    if value <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="CONVERSATION_MODEL_IMAGE_MAX_BYTES must be greater than 0.",
+        )
+    return value
 
 
 def _effective_default_model(tenant_id: str, user_id: str) -> tuple[str, str, str]:
@@ -286,8 +306,10 @@ def _count_assistant_turns(conversation: dict[str, Any], *, user_id: str) -> int
 def _conversation_model_list_response(
     conversation_id: str,
     model_ids: list[str],
+    model_images: dict[str, str] | None = None,
 ) -> ConversationAssignedModelListSchema:
     models: list[ConversationAssignedModelSchema] = []
+    image_map = model_images or {}
     for model_id in model_ids:
         model = get_chat_model(model_id)
         if model is None or not _is_supported_conversation_model(model.provider, model.is_active):
@@ -300,6 +322,7 @@ def _conversation_model_list_response(
                 model=model.model,
                 display_name=model.display_name,
                 description=model.description,
+                image_data_url=image_map.get(model.model_id),
             )
         )
     return ConversationAssignedModelListSchema(conversation_id=conversation_id, models=models)
@@ -691,6 +714,11 @@ async def conversation_model_list(access: AccessContext = Depends(require_access
         tenant_id=access.tenant,
         user_id=access.subject,
     )
+    model_images = await run_in_threadpool(
+        user_model_preference_store.get_model_image_map,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
 
     items: List[ConversationModelOptionSchema] = []
     for item in all_models:
@@ -706,6 +734,7 @@ async def conversation_model_list(access: AccessContext = Depends(require_access
                 description=item.description,
                 is_global_default=item.is_default,
                 is_user_default=(item.model_id == user_default_id),
+                image_data_url=model_images.get(item.model_id),
             )
         )
     return items
@@ -765,6 +794,52 @@ async def clear_conversation_default_model(access: AccessContext = Depends(requi
     return UserDefaultModelSchema(model_id=model_id, display_name=display_name, source=source)
 
 
+@conversation_router.put("/model/{model_id}/image", response_model=ConversationModelImageSchema)
+async def set_conversation_model_image(
+    model_id: str,
+    payload: ConversationModelImageUpdateSchema,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:model:set_default")
+    requested_model_id = model_id.strip()
+    model = await run_in_threadpool(get_chat_model, requested_model_id)
+    if model is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Requested model is not registered.")
+    if not _is_supported_conversation_model(model.provider, model.is_active):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requested model is not available for conversations.")
+
+    normalized_image_data_url = normalize_image_data_url_or_raise(
+        field_name="image_data_url",
+        value=payload.image_data_url,
+        max_bytes=_conversation_model_image_max_bytes(),
+    )
+    await run_in_threadpool(
+        user_model_preference_store.set_model_image_data_url,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        model_id=model.model_id,
+        image_data_url=normalized_image_data_url,
+    )
+    return ConversationModelImageSchema(model_id=model.model_id, image_data_url=normalized_image_data_url)
+
+
+@conversation_router.delete("/model/{model_id}/image", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_conversation_model_image(
+    model_id: str,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:model:set_default")
+    requested_model_id = model_id.strip()
+    if not requested_model_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="model_id is required.")
+    await run_in_threadpool(
+        user_model_preference_store.clear_model_image,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        model_id=requested_model_id,
+    )
+
+
 @conversation_router.get("/{conversation_id}/models", response_model=ConversationAssignedModelListSchema)
 async def get_conversation_models(conversation_id: str, access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:get", resource_id=conversation_id)
@@ -774,7 +849,12 @@ async def get_conversation_models(conversation_id: str, access: AccessContext = 
         user_id=access.subject,
         conversation_id=conversation_id,
     )
-    return await run_in_threadpool(_conversation_model_list_response, conversation_id, model_ids)
+    model_images = await run_in_threadpool(
+        user_model_preference_store.get_model_image_map,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+    return await run_in_threadpool(_conversation_model_list_response, conversation_id, model_ids, model_images)
 
 
 @conversation_router.post("/{conversation_id}/models", response_model=ConversationAssignedModelListSchema)
@@ -806,7 +886,12 @@ async def add_conversation_model(
         conversation_id=conversation_id,
         model_ids=model_ids,
     )
-    return await run_in_threadpool(_conversation_model_list_response, conversation_id, updated_ids)
+    model_images = await run_in_threadpool(
+        user_model_preference_store.get_model_image_map,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+    return await run_in_threadpool(_conversation_model_list_response, conversation_id, updated_ids, model_images)
 
 
 @conversation_router.delete("/{conversation_id}/models/{model_id}", response_model=ConversationAssignedModelListSchema)
@@ -848,7 +933,12 @@ async def remove_conversation_model(
         conversation_id=conversation_id,
         model_ids=updated_ids,
     )
-    return await run_in_threadpool(_conversation_model_list_response, conversation_id, stored_ids)
+    model_images = await run_in_threadpool(
+        user_model_preference_store.get_model_image_map,
+        tenant_id=access.tenant,
+        user_id=access.subject,
+    )
+    return await run_in_threadpool(_conversation_model_list_response, conversation_id, stored_ids, model_images)
 
 
 @conversation_router.get("/{conversation_id}", response_model=ConversationDetailSchema)
