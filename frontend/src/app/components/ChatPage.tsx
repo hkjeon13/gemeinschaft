@@ -22,7 +22,9 @@ import {
   getConversationRoomModels,
   addConversationRoomModel,
   removeConversationRoomModel,
-  continueConversation,
+  getContinueConversationStatus,
+  startContinueConversation,
+  stopContinueConversation,
   type ConversationModelOption,
   type ConversationRoomModel,
 } from '../utils/api';
@@ -1079,7 +1081,7 @@ function ConversationHeader({
   onDelete?: () => void;
   isContinuing?: boolean;
   onOpenContinueSettings?: () => void;
-  onStopContinue?: () => void;
+  onStopContinue?: () => void | Promise<void>;
   onMenuToggle?: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1316,9 +1318,6 @@ export function ChatPage() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const currentUserRef = useRef('');
-  const selectedConversationIdRef = useRef<string | null>(null);
-  const continuingConversationIdRef = useRef<string | null>(null);
-  const continueRunningRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -1327,11 +1326,6 @@ export function ChatPage() {
   useEffect(() => { scrollToBottom(); }, [currentConversation?.messages, sending]);
   useEffect(() => { loadInitialData(); }, []);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
-  useEffect(() => { selectedConversationIdRef.current = selectedConversationId; }, [selectedConversationId]);
-  useEffect(() => { continuingConversationIdRef.current = continuingConversationId; }, [continuingConversationId]);
-  useEffect(() => () => {
-    continueRunningRef.current = false;
-  }, []);
   useEffect(() => {
     const handler = () => {
       // 비로그인 초기 진입에서는 자동으로 모달을 띄우지 않는다.
@@ -1340,9 +1334,73 @@ export function ChatPage() {
     window.addEventListener('auth:required', handler);
     return () => window.removeEventListener('auth:required', handler);
   }, []);
+  useEffect(() => {
+    if (!currentUser || !selectedConversationId) return;
+    let cancelled = false;
+
+    const refreshStatus = async () => {
+      try {
+        const status = await getContinueConversationStatus(selectedConversationId);
+        if (cancelled) return;
+        if (status.running) {
+          setContinuingConversationId(selectedConversationId);
+          return;
+        }
+        if (status.active_conversation_id) {
+          setContinuingConversationId(status.active_conversation_id);
+          return;
+        }
+        setContinuingConversationId(null);
+      } catch {
+        if (!cancelled) {
+          setContinuingConversationId(null);
+        }
+      }
+    };
+
+    refreshStatus();
+    const timer = window.setInterval(refreshStatus, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentUser, selectedConversationId]);
+  useEffect(() => {
+    if (!currentUser || !selectedConversationId || continuingConversationId !== selectedConversationId) return;
+    let cancelled = false;
+    let inFlight = false;
+
+    const refreshConversation = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const [conv, list] = await Promise.all([
+          getConversation(selectedConversationId),
+          getConversationList(),
+        ]);
+        if (cancelled) return;
+        setCurrentConversation(conv);
+        setConversations(list);
+      } catch (err) {
+        if (!cancelled) {
+          console.error('Failed to refresh continuing conversation:', err);
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    refreshConversation();
+    const timer = window.setInterval(refreshConversation, 2200);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentUser, selectedConversationId, continuingConversationId]);
 
   const loadInitialData = async () => {
     setLoading(true);
+    setContinuingConversationId(null);
     try {
       const meData = await getMe();
       setCurrentUser(meData.sub);
@@ -1358,6 +1416,7 @@ export function ChatPage() {
       setConversations([]);
       setCurrentConversation(null);
       setSelectedConversationId(null);
+      setContinuingConversationId(null);
     } finally {
       setLoading(false);
     }
@@ -1413,11 +1472,15 @@ export function ChatPage() {
     if (deletingId) return;
     setDeletingId(convId);
     try {
-      await hideConversation(convId);
-      if (continueRunningRef.current && continuingConversationIdRef.current === convId) {
-        continueRunningRef.current = false;
+      if (continuingConversationId === convId) {
+        try {
+          await stopContinueConversation(convId);
+        } catch (err) {
+          console.error('Failed to stop continue runtime before delete:', err);
+        }
         setContinuingConversationId(null);
       }
+      await hideConversation(convId);
       setConversations((prev) => prev.filter((c) => c.conversation_id !== convId));
       if (selectedConversationId === convId) {
         setSelectedConversationId(null);
@@ -1524,7 +1587,6 @@ export function ChatPage() {
 
   const handleLogout = async () => {
     try { await logout(); } catch { /* ignore */ }
-    continueRunningRef.current = false;
     setContinuingConversationId(null);
     // 로그아웃 후에는 채팅 화면만 유지하고, 채팅 액션 시 로그인 유도
     setCurrentUser('');
@@ -1547,59 +1609,43 @@ export function ChatPage() {
   const handleStartContinue = async (settings: ContinueSettings) => {
     if (!selectedConversationId) return;
     const convId = selectedConversationId;
-    if (continueRunningRef.current && continuingConversationIdRef.current && continuingConversationIdRef.current !== convId) {
-      alert('다른 대화에서 연속 대화가 진행 중입니다. 해당 대화로 이동해 중지 후 다시 시도해주세요.');
-      return;
-    }
-    continueRunningRef.current = true;
-    setContinuingConversationId(convId);
-    setShowContinueModal(false);
-
-    const loop = async () => {
-      while (continueRunningRef.current && continuingConversationIdRef.current === convId) {
-        try {
-          const updated = await continueConversation(convId, {
-            min_interval_seconds: settings.minInterval,
-            max_interval_seconds: settings.maxInterval,
-            max_turns: settings.maxTurns,
-          });
-          if (!continueRunningRef.current || continuingConversationIdRef.current !== convId) break;
-          if (selectedConversationIdRef.current === convId) {
-            setCurrentConversation(updated as Conversation);
-          }
-          // 대화 목록 조용히 갱신
-          try {
-            setConversations(await getConversationList());
-          } catch { /* ignore */ }
-        } catch (err) {
-          if (continuingConversationIdRef.current === convId) {
-            continueRunningRef.current = false;
-            setContinuingConversationId(null);
-            if (err instanceof Error && err.message.includes('409')) {
-              // max_turns 도달 — 정상 종료
-              console.log('[Continue] max_turns reached, stopping loop');
-            } else {
-              console.error('[Continue] loop error:', err);
-              const msg = err instanceof Error ? err.message : String(err);
-              alert(`연속 대화 오류: ${msg}`);
-            }
-          }
-          return;
-        }
-      }
-      if (continuingConversationIdRef.current === convId) {
-        continueRunningRef.current = false;
+    try {
+      const runtime = await startContinueConversation(convId, {
+        min_interval_seconds: settings.minInterval,
+        max_interval_seconds: settings.maxInterval,
+        max_turns: settings.maxTurns,
+      });
+      setShowContinueModal(false);
+      if (runtime.running) {
+        setContinuingConversationId(convId);
+      } else if (runtime.active_conversation_id) {
+        setContinuingConversationId(runtime.active_conversation_id);
+      } else {
         setContinuingConversationId(null);
       }
-    };
-
-    loop();
+    } catch (err) {
+      console.error('Failed to start continue runtime:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`연속 대화 시작 실패: ${msg}`);
+    }
   };
 
-  const handleStopContinue = () => {
-    if (!selectedConversationId || continuingConversationIdRef.current !== selectedConversationId) return;
-    continueRunningRef.current = false;
-    setContinuingConversationId(null);
+  const handleStopContinue = async () => {
+    if (!selectedConversationId) return;
+    try {
+      const runtime = await stopContinueConversation(selectedConversationId);
+      if (runtime.running) {
+        setContinuingConversationId(selectedConversationId);
+      } else if (runtime.active_conversation_id) {
+        setContinuingConversationId(runtime.active_conversation_id);
+      } else {
+        setContinuingConversationId(null);
+      }
+    } catch (err) {
+      console.error('Failed to stop continue runtime:', err);
+      const msg = err instanceof Error ? err.message : String(err);
+      alert(`연속 대화 중지 실패: ${msg}`);
+    }
   };
 
   const roomModelImageMap = new Map(

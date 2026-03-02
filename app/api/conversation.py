@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -11,6 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from app.schemas.conversation import (
     ConversationContinueSchema,
+    ConversationContinueRuntimeStateSchema,
     ConversationDetailSchema,
     ConversationAssignedModelListSchema,
     ConversationAssignedModelSchema,
@@ -66,6 +69,29 @@ _TOPIC_SHIFT_SUGGESTIONS = (
     "최근 날씨와 컨디션",
     "요즘 하고 있는 취미",
 )
+_CONTINUE_STOP_REASON_STOPPED_BY_USER = "stopped_by_user"
+_CONTINUE_STOP_REASON_MAX_TURNS_REACHED = "max_turns_reached"
+_CONTINUE_STOP_REASON_CONVERSATION_NOT_FOUND = "conversation_not_found"
+_CONTINUE_STOP_REASON_ERROR = "error"
+_CONTINUE_STOP_REASON_SERVER_SHUTDOWN = "server_shutdown"
+
+
+@dataclass
+class _ContinueRuntimeJob:
+    tenant_id: str
+    user_id: str
+    conversation_id: str
+    payload: ConversationContinueSchema
+    started_at: str
+    stop_requested: bool = False
+    stopped_at: Optional[str] = None
+    stop_reason: Optional[str] = None
+    last_error: Optional[str] = None
+    task: Optional[asyncio.Task[Any]] = None
+
+
+_continue_jobs_lock = asyncio.Lock()
+_continue_jobs: dict[tuple[str, str], _ContinueRuntimeJob] = {}
 
 
 def _is_supported_conversation_model(provider: str, is_active: bool) -> bool:
@@ -299,6 +325,111 @@ def _count_assistant_turns(conversation: dict[str, Any], *, user_id: str) -> int
             count += 1
     return count
 
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clone_continue_payload(payload: ConversationContinueSchema) -> ConversationContinueSchema:
+    return payload.model_copy(deep=True)
+
+
+def _continue_job_is_running(job: _ContinueRuntimeJob) -> bool:
+    return bool(job.task is not None and not job.task.done() and not job.stop_requested)
+
+
+def _stringify_http_exception_detail(detail: Any) -> str:
+    if isinstance(detail, str):
+        return detail
+    if isinstance(detail, dict):
+        try:
+            return json.dumps(detail, ensure_ascii=False)
+        except TypeError:
+            return str(detail)
+    if isinstance(detail, list):
+        try:
+            return json.dumps(detail, ensure_ascii=False)
+        except TypeError:
+            return str(detail)
+    return str(detail)
+
+
+def _continue_runtime_snapshot_for_conversation(
+    *,
+    conversation_id: str,
+    active_job: Optional[_ContinueRuntimeJob],
+) -> ConversationContinueRuntimeStateSchema:
+    active_conversation_id = None
+    if active_job is not None and _continue_job_is_running(active_job):
+        active_conversation_id = active_job.conversation_id
+
+    if active_job is None or active_job.conversation_id != conversation_id:
+        return ConversationContinueRuntimeStateSchema(
+            conversation_id=conversation_id,
+            running=False,
+            active_conversation_id=active_conversation_id,
+        )
+
+    return ConversationContinueRuntimeStateSchema(
+        conversation_id=conversation_id,
+        running=_continue_job_is_running(active_job),
+        active_conversation_id=active_conversation_id,
+        started_at=active_job.started_at,
+        stopped_at=active_job.stopped_at,
+        min_interval_seconds=active_job.payload.min_interval_seconds,
+        max_interval_seconds=active_job.payload.max_interval_seconds,
+        max_turns=active_job.payload.max_turns,
+        model_id=active_job.payload.model_id,
+        model_ids=active_job.payload.model_ids,
+        stop_reason=active_job.stop_reason,
+        last_error=active_job.last_error,
+    )
+
+
+async def _get_active_continue_job(*, tenant_id: str, user_id: str) -> Optional[_ContinueRuntimeJob]:
+    async with _continue_jobs_lock:
+        return _continue_jobs.get((tenant_id, user_id))
+
+
+async def _validate_continue_start_or_raise(
+    *,
+    tenant_id: str,
+    user_id: str,
+    conversation_id: str,
+    payload: ConversationContinueSchema,
+) -> None:
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    if not isinstance(conversation.get("messages"), list) or not conversation.get("messages"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Conversation has no messages to continue from.")
+    if payload.max_turns is not None:
+        current_turns = _count_assistant_turns(conversation, user_id=user_id)
+        if current_turns >= payload.max_turns:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"max_turns reached ({payload.max_turns}).",
+            )
+
+    conversation_model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    continue_candidates = _resolve_continue_model_candidates(
+        available_model_ids=conversation_model_ids,
+        requested_model_id=(payload.model_id.strip() if payload.model_id is not None else None),
+        requested_model_ids=payload.model_ids,
+    )
+    has_explicit_model_selection = payload.model_id is not None or bool(payload.model_ids)
+    if not has_explicit_model_selection:
+        _ensure_continue_min_participants(continue_candidates)
 
 def _conversation_model_list_response(
     conversation_id: str,
@@ -692,6 +823,173 @@ async def _stream_assistant_reply(
         return
 
 
+async def _prepare_continue_generation(
+    *,
+    tenant_id: str,
+    user_id: str,
+    conversation_id: str,
+    payload: ConversationContinueSchema,
+) -> tuple[dict[str, Any], ResolvedChatModel, AsyncOpenAIChatModel, list[dict[str, Any]], float]:
+    conversation = await run_in_threadpool(
+        conversation_store.get_conversation,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    if conversation is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
+    if not isinstance(conversation.get("messages"), list) or not conversation.get("messages"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Conversation has no messages to continue from.")
+    if payload.max_turns is not None:
+        current_turns = _count_assistant_turns(conversation, user_id=user_id)
+        if current_turns >= payload.max_turns:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"max_turns reached ({payload.max_turns}).",
+            )
+
+    conversation_model_ids = await run_in_threadpool(
+        _conversation_model_ids_or_default,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+    )
+    continue_candidates = _resolve_continue_model_candidates(
+        available_model_ids=conversation_model_ids,
+        requested_model_id=(payload.model_id.strip() if payload.model_id is not None else None),
+        requested_model_ids=payload.model_ids,
+    )
+    has_explicit_model_selection = payload.model_id is not None or bool(payload.model_ids)
+    if not has_explicit_model_selection:
+        _ensure_continue_min_participants(continue_candidates)
+    selected_model_id = random.choice(continue_candidates)
+
+    selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
+    if selected_model.provider != "openai":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported provider: {selected_model.provider}",
+        )
+    model_client = _chat_model(selected_model)
+
+    messages = _conversation_to_openai_messages(
+        conversation,
+        selected_model_id=selected_model.model_id,
+    )
+    messages = _prepend_developer_prompt(
+        messages,
+        selected_model_id=selected_model.model_id,
+        selected_model_display_name=selected_model.display_name,
+        user_id=user_id,
+    )
+    if not messages:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to build chat messages.")
+
+    delay_seconds = _resolve_continue_interval_seconds(
+        min_interval_seconds=payload.min_interval_seconds,
+        max_interval_seconds=payload.max_interval_seconds,
+    )
+    return conversation, selected_model, model_client, messages, delay_seconds
+
+
+async def _continue_dialogue_once(
+    *,
+    tenant_id: str,
+    user_id: str,
+    conversation_id: str,
+    payload: ConversationContinueSchema,
+) -> dict[str, Any]:
+    conversation, selected_model, model_client, messages, delay_seconds = await _prepare_continue_generation(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        payload=payload,
+    )
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
+
+    generated_conversation = await _generate_assistant_reply(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        model_id=selected_model.model_id,
+        model_name=selected_model.model,
+        model_display_name=selected_model.display_name,
+        provider=selected_model.provider,
+        chat_model=model_client,
+        messages=messages,
+    )
+    if generated_conversation is not None:
+        return generated_conversation
+    return conversation
+
+
+async def _continue_runtime_loop(job: _ContinueRuntimeJob) -> None:
+    try:
+        while not job.stop_requested:
+            try:
+                await _continue_dialogue_once(
+                    tenant_id=job.tenant_id,
+                    user_id=job.user_id,
+                    conversation_id=job.conversation_id,
+                    payload=job.payload,
+                )
+            except HTTPException as exc:
+                if exc.status_code == status.HTTP_409_CONFLICT:
+                    job.stop_reason = _CONTINUE_STOP_REASON_MAX_TURNS_REACHED
+                    job.stopped_at = _utc_now_iso()
+                    return
+                if exc.status_code == status.HTTP_404_NOT_FOUND:
+                    job.stop_reason = _CONTINUE_STOP_REASON_CONVERSATION_NOT_FOUND
+                    job.stopped_at = _utc_now_iso()
+                    return
+                job.stop_reason = _CONTINUE_STOP_REASON_ERROR
+                job.last_error = _stringify_http_exception_detail(exc.detail)
+                job.stopped_at = _utc_now_iso()
+                return
+            except ValueError as exc:
+                job.stop_reason = _CONTINUE_STOP_REASON_ERROR
+                job.last_error = str(exc)
+                job.stopped_at = _utc_now_iso()
+                return
+            except Exception as exc:
+                job.stop_reason = _CONTINUE_STOP_REASON_ERROR
+                job.last_error = str(exc)
+                job.stopped_at = _utc_now_iso()
+                logger.exception("Continue runtime loop failed.")
+                return
+    except asyncio.CancelledError:
+        if job.stopped_at is None:
+            job.stopped_at = _utc_now_iso()
+        if job.stop_reason is None:
+            job.stop_reason = (
+                _CONTINUE_STOP_REASON_STOPPED_BY_USER if job.stop_requested else _CONTINUE_STOP_REASON_SERVER_SHUTDOWN
+            )
+        raise
+    finally:
+        if job.stopped_at is None:
+            job.stopped_at = _utc_now_iso()
+        if job.stop_reason is None:
+            job.stop_reason = _CONTINUE_STOP_REASON_STOPPED_BY_USER if job.stop_requested else "completed"
+
+
+async def shutdown_continue_runtime_jobs() -> None:
+    async with _continue_jobs_lock:
+        running_jobs = [job for job in _continue_jobs.values() if job.task is not None and not job.task.done()]
+        for job in running_jobs:
+            job.stop_requested = True
+            job.stop_reason = _CONTINUE_STOP_REASON_SERVER_SHUTDOWN
+            job.stopped_at = _utc_now_iso()
+            if job.task is not None:
+                job.task.cancel()
+
+    if running_jobs:
+        await asyncio.gather(
+            *[job.task for job in running_jobs if job.task is not None],
+            return_exceptions=True,
+        )
+
+
 @conversation_router.get("/list", response_model=List[ConversationSummarySchema])
 async def conversation_list(access: AccessContext = Depends(require_access_context)):
     authorize_action(access, action="conversation:list")
@@ -1067,6 +1365,94 @@ async def create_dialogue(
     return conversation
 
 
+@conversation_router.get("/{conversation_id}/continue/status", response_model=ConversationContinueRuntimeStateSchema)
+async def continue_dialogue_status(
+    conversation_id: str,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:get", resource_id=conversation_id)
+    active_job = await _get_active_continue_job(tenant_id=access.tenant, user_id=access.subject)
+    return _continue_runtime_snapshot_for_conversation(conversation_id=conversation_id, active_job=active_job)
+
+
+@conversation_router.post("/{conversation_id}/continue/start", response_model=ConversationContinueRuntimeStateSchema)
+async def start_continue_dialogue_runtime(
+    conversation_id: str,
+    payload: ConversationContinueSchema,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:create", resource_id=conversation_id)
+    await _validate_continue_start_or_raise(
+        tenant_id=access.tenant,
+        user_id=access.subject,
+        conversation_id=conversation_id,
+        payload=payload,
+    )
+
+    user_key = (access.tenant, access.subject)
+    async with _continue_jobs_lock:
+        existing = _continue_jobs.get(user_key)
+        if existing is not None and existing.task is not None and not existing.task.done():
+            if existing.stop_requested:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Existing continue session is stopping. Please retry in a moment.",
+                )
+            if existing.conversation_id == conversation_id:
+                return _continue_runtime_snapshot_for_conversation(
+                    conversation_id=conversation_id,
+                    active_job=existing,
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Another continue session is running for conversation '{existing.conversation_id}'.",
+            )
+
+        job = _ContinueRuntimeJob(
+            tenant_id=access.tenant,
+            user_id=access.subject,
+            conversation_id=conversation_id,
+            payload=_clone_continue_payload(payload),
+            started_at=_utc_now_iso(),
+        )
+        job.task = asyncio.create_task(_continue_runtime_loop(job))
+        job.task.add_done_callback(_log_background_task_result)
+        _continue_jobs[user_key] = job
+        return _continue_runtime_snapshot_for_conversation(conversation_id=conversation_id, active_job=job)
+
+
+@conversation_router.post("/{conversation_id}/continue/stop", response_model=ConversationContinueRuntimeStateSchema)
+async def stop_continue_dialogue_runtime(
+    conversation_id: str,
+    access: AccessContext = Depends(require_access_context),
+):
+    authorize_action(access, action="conversation:update", resource_id=conversation_id)
+    user_key = (access.tenant, access.subject)
+    async with _continue_jobs_lock:
+        active_job = _continue_jobs.get(user_key)
+        if active_job is None:
+            return _continue_runtime_snapshot_for_conversation(conversation_id=conversation_id, active_job=None)
+
+        if (
+            active_job.conversation_id == conversation_id
+            and active_job.task is not None
+            and not active_job.task.done()
+            and not active_job.stop_requested
+        ):
+            active_job.stop_requested = True
+            active_job.stop_reason = _CONTINUE_STOP_REASON_STOPPED_BY_USER
+            active_job.stopped_at = _utc_now_iso()
+            active_job.task.cancel()
+        elif active_job.conversation_id == conversation_id and active_job.stop_reason is None:
+            active_job.stop_reason = _CONTINUE_STOP_REASON_STOPPED_BY_USER
+            active_job.stopped_at = active_job.stopped_at or _utc_now_iso()
+
+        return _continue_runtime_snapshot_for_conversation(
+            conversation_id=conversation_id,
+            active_job=active_job,
+        )
+
+
 @conversation_router.post("/{conversation_id}/continue", response_model=ConversationDetailSchema)
 async def continue_dialogue(
     conversation_id: str,
@@ -1075,69 +1461,16 @@ async def continue_dialogue(
     access: AccessContext = Depends(require_access_context),
 ):
     authorize_action(access, action="conversation:create", resource_id=conversation_id)
-    conversation = await run_in_threadpool(
-        conversation_store.get_conversation,
-        tenant_id=access.tenant,
-        user_id=access.subject,
-        conversation_id=conversation_id,
-    )
-    if conversation is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found.")
-    if not isinstance(conversation.get("messages"), list) or not conversation.get("messages"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Conversation has no messages to continue from.")
-    if payload.max_turns is not None:
-        current_turns = _count_assistant_turns(conversation, user_id=access.subject)
-        if current_turns >= payload.max_turns:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"max_turns reached ({payload.max_turns}).",
-            )
-
-    conversation_model_ids = await run_in_threadpool(
-        _conversation_model_ids_or_default,
-        tenant_id=access.tenant,
-        user_id=access.subject,
-        conversation_id=conversation_id,
-    )
-    continue_candidates = _resolve_continue_model_candidates(
-        available_model_ids=conversation_model_ids,
-        requested_model_id=(payload.model_id.strip() if payload.model_id is not None else None),
-        requested_model_ids=payload.model_ids,
-    )
-    has_explicit_model_selection = payload.model_id is not None or bool(payload.model_ids)
-    if not has_explicit_model_selection:
-        _ensure_continue_min_participants(continue_candidates)
-    selected_model_id = random.choice(continue_candidates)
-
-    selected_model = await run_in_threadpool(resolve_chat_model, selected_model_id)
-    if selected_model.provider != "openai":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported provider: {selected_model.provider}",
-        )
-    model_client = _chat_model(selected_model)
-
-    messages = _conversation_to_openai_messages(
-        conversation,
-        selected_model_id=selected_model.model_id,
-    )
-    messages = _prepend_developer_prompt(
-        messages,
-        selected_model_id=selected_model.model_id,
-        selected_model_display_name=selected_model.display_name,
-        user_id=access.subject,
-    )
-    if not messages:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to build chat messages.")
-
-    delay_seconds = _resolve_continue_interval_seconds(
-        min_interval_seconds=payload.min_interval_seconds,
-        max_interval_seconds=payload.max_interval_seconds,
-    )
-    if delay_seconds > 0:
-        await asyncio.sleep(delay_seconds)
 
     if stream:
+        conversation, selected_model, model_client, messages, delay_seconds = await _prepare_continue_generation(
+            tenant_id=access.tenant,
+            user_id=access.subject,
+            conversation_id=conversation_id,
+            payload=payload,
+        )
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
         event_queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=_STREAM_EVENT_QUEUE_MAXSIZE)
         stream_task = asyncio.create_task(
             _stream_assistant_reply_task(
@@ -1163,23 +1496,13 @@ async def continue_dialogue(
             media_type="text/event-stream",
         )
 
-    generation_task = asyncio.create_task(
-        _generate_assistant_reply(
+    try:
+        return await _continue_dialogue_once(
             tenant_id=access.tenant,
             user_id=access.subject,
             conversation_id=conversation_id,
-            model_id=selected_model.model_id,
-            model_name=selected_model.model,
-            model_display_name=selected_model.display_name,
-            provider=selected_model.provider,
-            chat_model=model_client,
-            messages=messages,
+            payload=payload,
         )
-    )
-    generation_task.add_done_callback(_log_background_task_result)
-
-    try:
-        generated_conversation = await asyncio.shield(generation_task)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1187,15 +1510,13 @@ async def continue_dialogue(
         )
     except asyncio.CancelledError:
         raise
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to generate assistant response: {exc}",
         )
-
-    if generated_conversation is not None:
-        return generated_conversation
-    return conversation
 
 
 @conversation_router.delete("/{conversation_id}", response_model=ConversationVisibilitySchema)

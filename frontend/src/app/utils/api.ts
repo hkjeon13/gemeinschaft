@@ -574,3 +574,45 @@ export async function continueConversation(
     body: JSON.stringify(options),
   });
 }
+
+export interface ContinueRuntimeState {
+  conversation_id: string;
+  running: boolean;
+  active_conversation_id?: string | null;
+  started_at?: string | null;
+  stopped_at?: string | null;
+  min_interval_seconds?: number | null;
+  max_interval_seconds?: number | null;
+  max_turns?: number | null;
+  model_id?: string | null;
+  model_ids?: string[] | null;
+  stop_reason?: string | null;
+  last_error?: string | null;
+}
+
+export async function getContinueConversationStatus(conversationId: string) {
+  return apiRequest<ContinueRuntimeState>(`/conversation/${conversationId}/continue/status`);
+}
+
+export async function startContinueConversation(
+  conversationId: string,
+  options: {
+    model_id?: string;
+    model_ids?: string[];
+    min_interval_seconds?: number;
+    max_interval_seconds?: number;
+    max_turns?: number;
+  } = {}
+) {
+  return apiRequest<ContinueRuntimeState>(`/conversation/${conversationId}/continue/start`, {
+    method: 'POST',
+    body: JSON.stringify(options),
+  });
+}
+
+export async function stopContinueConversation(conversationId: string) {
+  return apiRequest<ContinueRuntimeState>(`/conversation/${conversationId}/continue/stop`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  });
+}

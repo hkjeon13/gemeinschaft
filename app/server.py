@@ -18,6 +18,7 @@ from .services.conversation_model_list_store import initialize_conversation_mode
 from .services.database import validate_database_settings
 from .services.security_state import initialize_security_state
 from .services.user_model_preference_store import initialize_user_model_preference_store
+from .api.conversation import shutdown_continue_runtime_jobs
 
 __version__ = os.environ.get("VERSION", "0.0.0")
 app = FastAPI(
@@ -73,6 +74,7 @@ async def startup_validate_auth_settings() -> None:
 
 @app.on_event("shutdown")
 async def shutdown_conversation_background_tasks() -> None:
+    await shutdown_continue_runtime_jobs()
     shutdown_conversation_store()
 
 

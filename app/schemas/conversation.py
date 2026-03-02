@@ -80,6 +80,21 @@ class ConversationContinueSchema(BaseModel):
         return self
 
 
+class ConversationContinueRuntimeStateSchema(BaseModel):
+    conversation_id: str
+    running: bool
+    active_conversation_id: Optional[str] = None
+    started_at: Optional[str] = None
+    stopped_at: Optional[str] = None
+    min_interval_seconds: Optional[float] = None
+    max_interval_seconds: Optional[float] = None
+    max_turns: Optional[int] = None
+    model_id: Optional[str] = None
+    model_ids: Optional[List[str]] = None
+    stop_reason: Optional[str] = None
+    last_error: Optional[str] = None
+
+
 class MessageSchema(BaseModel):
     message_id: str
     role: Literal["user", "assistant", "system"]
