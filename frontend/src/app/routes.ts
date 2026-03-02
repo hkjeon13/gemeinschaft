@@ -1,36 +1,29 @@
-import { createBrowserRouter } from 'react-router';
-import { LoginPage } from './components/LoginPage';
+import { createBrowserRouter, redirect } from 'react-router';
 import { AdminPage } from './components/AdminPage';
 import { ChatPage } from './components/ChatPage';
 
 export const router = createBrowserRouter(
   [
     {
-      path: '/login',
-      Component: LoginPage,
+      path: '/chat',
+      Component: ChatPage,
     },
     {
       path: '/admin',
       Component: AdminPage,
     },
+    // /login 과 / 는 /chat 으로 리다이렉트 (로그인은 팝업으로 처리)
     {
-      path: '/chat',
-      Component: ChatPage,
+      path: '/login',
+      loader: () => redirect('/chat'),
     },
     {
       path: '/',
-      loader: () => {
-        // 루트 경로는 로그인 페이지로 리다이렉트
-        window.location.href = '/login';
-        return null;
-      },
+      loader: () => redirect('/chat'),
     },
     {
       path: '*',
-      Component: () => {
-        window.location.href = '/login';
-        return null;
-      },
+      loader: () => redirect('/chat'),
     },
   ],
   {

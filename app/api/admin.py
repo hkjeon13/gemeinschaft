@@ -5,6 +5,7 @@ from typing import List
 from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.schemas.admin import (
+    AdminApiKeyRefSchema,
     AdminChatModelCreateSchema,
     AdminChatModelSchema,
     AdminChatModelUpdateSchema,
@@ -108,6 +109,13 @@ def _model_schema(item) -> AdminChatModelSchema:
         client_options=item.client_options,
         chat_create_options=item.chat_create_options,
         responses_create_options=item.responses_create_options,
+        api_key_refs=[
+            AdminApiKeyRefSchema(
+                key_id=api_key_ref.key_id,
+                masked_key=api_key_ref.masked_key,
+            )
+            for api_key_ref in item.api_key_refs
+        ],
         has_api_key=item.has_api_key,
         has_webhook_secret=item.has_webhook_secret,
         is_active=item.is_active,
@@ -240,6 +248,7 @@ async def admin_update_model(
         and payload.api_key is None
         and payload.api_keys is None
         and payload.append_api_keys is None
+        and payload.remove_api_key_ids is None
         and payload.clear_api_key is None
         and payload.webhook_secret is None
         and payload.clear_webhook_secret is None
@@ -265,6 +274,7 @@ async def admin_update_model(
         api_key=payload.api_key,
         api_keys=payload.api_keys,
         append_api_keys=payload.append_api_keys,
+        remove_api_key_ids=payload.remove_api_key_ids,
         clear_api_key=payload.clear_api_key,
         webhook_secret=payload.webhook_secret,
         clear_webhook_secret=payload.clear_webhook_secret,

@@ -25,6 +25,11 @@ class AdminUserUpdateSchema(BaseModel):
     scopes: Optional[List[str]] = None
 
 
+class AdminApiKeyRefSchema(BaseModel):
+    key_id: str
+    masked_key: str
+
+
 class AdminChatModelSchema(BaseModel):
     model_id: str
     provider: str
@@ -36,6 +41,7 @@ class AdminChatModelSchema(BaseModel):
     client_options: Dict[str, Any]
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
+    api_key_refs: List[AdminApiKeyRefSchema]
     has_api_key: bool
     has_webhook_secret: bool
     is_active: bool
@@ -75,6 +81,7 @@ class AdminChatModelUpdateSchema(BaseModel):
     api_key: Optional[str] = Field(default=None, min_length=1)
     api_keys: Optional[List[str]] = None
     append_api_keys: Optional[List[str]] = None
+    remove_api_key_ids: Optional[List[str]] = None
     clear_api_key: Optional[bool] = None
     webhook_secret: Optional[str] = Field(default=None, min_length=1)
     clear_webhook_secret: Optional[bool] = None

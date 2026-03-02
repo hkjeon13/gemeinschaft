@@ -26,8 +26,6 @@ export function LoginPage() {
           setError('로그인 시도 횟수가 초과되었습니다. 잠시 후 다시 시도해주세요.');
         } else if (err.message.includes('403')) {
           setError('접근이 거부되었습니다. CSRF 또는 Origin 정책 위반입니다.');
-        } else if (err.message.includes('Failed to fetch')) {
-          setError('서버 연결에 실패했습니다. CORS/네트워크/서버 상태를 확인해주세요.');
         } else {
           setError('로그인 중 오류가 발생했습니다. 다시 시도해주세요.');
         }
@@ -39,7 +37,7 @@ export function LoginPage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
-      <div className="max-w-md w-full space-y-8 p-8 bg-white rounded-lg shadow-md">
+      <div className="max-w-md w-full space-y-8 p-6 sm:p-8 bg-white rounded-lg shadow-md mx-4 sm:mx-0">
         <div>
           <h2 className="text-center text-3xl font-extrabold text-gray-900">
             로그인

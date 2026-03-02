@@ -2,38 +2,12 @@
 
 import { generateDpopProof } from './dpop';
 
-function resolveBaseUrl(): string {
-  const configured = (import.meta.env.VITE_API_BASE_URL ?? '').trim();
-  if (configured) {
-    return configured.replace(/\/+$/, '');
-  }
-
-  if (typeof window !== 'undefined') {
-    const hostname = window.location.hostname.toLowerCase();
-    // Figma preview runs on *.figma.site and cannot use same-origin /api.
-    if (hostname === 'figma.site' || hostname.endsWith('.figma.site')) {
-      return 'https://dataset.fin-ally.net/api';
-    }
-  }
-
-  return '/api';
-}
-
-const BASE_URL = resolveBaseUrl();
+const configuredBaseUrl = (import.meta.env.VITE_API_BASE_URL ?? '').trim();
+const BASE_URL = (configuredBaseUrl || 'https://dataset.fin-ally.net/api').replace(/\/+$/, '');
 const CSRF_STORAGE_KEY = 'csrf_token';
 
-function resolveDebugFlag(): boolean {
-  const configured = (import.meta.env.VITE_API_DEBUG ?? '').trim().toLowerCase();
-  if (configured === 'true') {
-    return true;
-  }
-  if (configured === 'false') {
-    return false;
-  }
-  return !!import.meta.env.DEV;
-}
-
-const DEBUG = resolveDebugFlag();
+// 디버그 모드
+const DEBUG = true;
 
 interface FetchOptions extends RequestInit {
   skipRefresh?: boolean;
@@ -48,19 +22,6 @@ function resolveRequestCredentials(): RequestCredentials {
 }
 
 const REQUEST_CREDENTIALS = resolveRequestCredentials();
-
-function shouldSetJsonContentType(body: BodyInit | null | undefined): boolean {
-  if (body === null || body === undefined) {
-    return false;
-  }
-  if (typeof FormData !== 'undefined' && body instanceof FormData) {
-    return false;
-  }
-  if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
-    return false;
-  }
-  return true;
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -124,6 +85,7 @@ async function refreshToken(): Promise<boolean> {
         credentials: REQUEST_CREDENTIALS,
         headers: {
           'DPoP': dpopProof,
+          'Content-Type': 'application/json',
         },
       });
 
@@ -166,19 +128,19 @@ export async function apiRequest<T>(
   const dpopProof = await generateDpopProof(method, url);
 
   // 헤더 설정
-  const headers = new Headers(fetchOptions.headers);
-  headers.set('DPoP', dpopProof);
-  if (!headers.has('Content-Type') && shouldSetJsonContentType(fetchOptions.body)) {
-    headers.set('Content-Type', 'application/json');
-  }
+  const headers: Record<string, string> = {
+    'DPoP': dpopProof,
+    'Content-Type': 'application/json',
+    ...(fetchOptions.headers as Record<string, string>),
+  };
 
   // 상태 변경 요청일 경우 CSRF 토큰 추가
   if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(method)) {
     const csrfToken = getCsrfToken();
     if (csrfToken) {
-      headers.set('x-csrf-token', csrfToken);
+      headers['x-csrf-token'] = csrfToken;
       if (DEBUG) {
-        console.log('[API] Added CSRF token');
+        console.log('[API] Added CSRF token:', csrfToken.substring(0, 20) + '...');
       }
     } else {
       // 로그인 요청이 아닌 경우에만 경고 표시
@@ -189,7 +151,7 @@ export async function apiRequest<T>(
   }
 
   if (DEBUG) {
-    console.log('[API] Request headers:', Array.from(headers.keys()));
+    console.log('[API] Request headers:', Object.keys(headers));
     console.log('[API] Full URL:', url);
   }
 
@@ -207,22 +169,16 @@ export async function apiRequest<T>(
 
     // 401 에러일 경우 토큰 갱신 시도
     if (response.status === 401 && !skipRefresh) {
-      if (DEBUG) {
-        console.log('[API] 401 received, attempting token refresh...');
-      }
+      console.log('[API] 401 received, attempting token refresh...');
       const refreshed = await refreshToken();
       if (refreshed) {
-        if (DEBUG) {
-          console.log('[API] Token refreshed, retrying request...');
-        }
+        console.log('[API] Token refreshed, retrying request...');
         // 토큰 갱신 성공 시 재요청
         return apiRequest<T>(endpoint, { ...options, skipRefresh: true });
       } else {
-        // 토큰 갱신 실패 시 로그인 페이지로 이동
-        if (DEBUG) {
-          console.error('[API] Token refresh failed, redirecting to login');
-        }
-        window.location.href = '/login';
+        // 토큰 갱신 실패 시 인증 필요 이벤트 발행
+        console.error('[API] Token refresh failed, dispatching auth:required event');
+        window.dispatchEvent(new CustomEvent('auth:required'));
         throw new Error('Authentication failed');
       }
     }
@@ -449,6 +405,7 @@ export async function createModel(data: {
   chat_create_options?: Record<string, unknown>;
   responses_create_options?: Record<string, unknown>;
   api_key?: string;
+  api_keys?: string[];
   webhook_secret?: string;
   is_active?: boolean;
   is_default?: boolean;
@@ -473,6 +430,8 @@ export async function updateModel(
     chat_create_options?: Record<string, unknown>;
     responses_create_options?: Record<string, unknown>;
     api_key?: string;
+    api_keys?: string[];
+    append_api_keys?: string[];
     webhook_secret?: string;
     clear_api_key?: boolean;
     clear_webhook_secret?: boolean;

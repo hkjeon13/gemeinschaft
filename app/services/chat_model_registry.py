@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Dict, List, Optional
+from uuid import UUID, uuid4, uuid5
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException, status
@@ -375,6 +376,21 @@ def _decrypt_secret_or_raise(field_name: str, token: str) -> str:
         )
 
 
+_LEGACY_API_KEY_NAMESPACE = UUID("f1eb1e2b-9127-4d7a-8dd7-2619b7ce7da3")
+
+
+@dataclass
+class StoredApiKey:
+    key_id: str
+    key_value: str
+
+
+@dataclass
+class ApiKeyRef:
+    key_id: str
+    masked_key: str
+
+
 def _normalize_secret_list_or_raise(field_name: str, values: Any) -> List[str]:
     if not isinstance(values, list):
         raise HTTPException(
@@ -403,6 +419,69 @@ def _normalize_secret_list_or_raise(field_name: str, values: Any) -> List[str]:
     return normalized
 
 
+def _normalize_api_key_id_or_raise(field_name: str, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must contain non-empty UUID strings.",
+        )
+    try:
+        return str(UUID(normalized))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must contain valid UUID strings.",
+        )
+
+
+def _normalize_api_key_id_list_or_raise(field_name: str, values: Any) -> List[str]:
+    if not isinstance(values, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must be a list of UUID strings.",
+        )
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must contain UUID strings.",
+            )
+        api_key_id = _normalize_api_key_id_or_raise(field_name, item)
+        if api_key_id in seen:
+            continue
+        seen.add(api_key_id)
+        normalized.append(api_key_id)
+    return normalized
+
+
+def _legacy_api_key_id(key_value: str) -> str:
+    return str(uuid5(_LEGACY_API_KEY_NAMESPACE, key_value))
+
+
+def _new_api_key_items(values: List[str]) -> List[StoredApiKey]:
+    return [StoredApiKey(key_id=str(uuid4()), key_value=value) for value in values]
+
+
+def _api_key_values(items: List[StoredApiKey]) -> List[str]:
+    return [item.key_value for item in items]
+
+
+def _mask_api_key(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return "***"
+    if len(text) <= 4:
+        return "*" * len(text)
+    return f"{text[:2]}***{text[-2:]}"
+
+
+def _api_key_refs(items: List[StoredApiKey]) -> List[ApiKeyRef]:
+    return [ApiKeyRef(key_id=item.key_id, masked_key=_mask_api_key(item.key_value)) for item in items]
+
+
 def _resolve_api_key_input_or_raise(*, api_key: Optional[str], api_keys: Optional[List[str]]) -> Optional[List[str]]:
     if api_key is not None and api_keys is not None:
         raise HTTPException(
@@ -416,12 +495,15 @@ def _resolve_api_key_input_or_raise(*, api_key: Optional[str], api_keys: Optiona
     return None
 
 
-def _encrypt_api_keys_or_raise(api_keys: List[str]) -> str:
-    serialized = json.dumps(api_keys)
+def _encrypt_api_keys_or_raise(api_keys: List[StoredApiKey]) -> str:
+    serialized = json.dumps(
+        [{"id": item.key_id, "value": item.key_value} for item in api_keys],
+        ensure_ascii=False,
+    )
     return _encrypt_secret_or_raise("api_key", serialized)
 
 
-def _decrypt_api_keys_or_raise(token: str) -> List[str]:
+def _decrypt_api_keys_or_raise(token: str) -> List[StoredApiKey]:
     decrypted = _decrypt_secret_or_raise("api_key", token).strip()
     if not decrypted:
         return []
@@ -429,14 +511,62 @@ def _decrypt_api_keys_or_raise(token: str) -> List[str]:
     try:
         parsed = json.loads(decrypted)
     except ValueError:
-        return [decrypted]
+        return [StoredApiKey(key_id=_legacy_api_key(decrypted), key_value=decrypted)]
 
     if isinstance(parsed, list):
-        return _normalize_secret_list_or_raise("api_key", parsed)
+        normalized: List[StoredApiKey] = []
+        seen_values: set[str] = set()
+        seen_ids: set[str] = set()
+        for item in parsed:
+            if isinstance(item, str):
+                key_value = item.strip()
+                if not key_value or key_value in seen_values:
+                    continue
+                key_id = _legacy_api_key(key_value)
+                seen_values.add(key_value)
+                seen_ids.add(key_id)
+                normalized.append(StoredApiKey(key_id=key_id, key_value=key_value))
+                continue
+
+            if not isinstance(item, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Stored api_key has invalid format.",
+                )
+
+            key_value_raw = item.get("value")
+            if not isinstance(key_value_raw, str):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Stored api_key has invalid format.",
+                )
+            key_value = key_value_raw.strip()
+            if not key_value or key_value in seen_values:
+                continue
+
+            key_id_raw = item.get("id")
+            if isinstance(key_id_raw, str) and key_id_raw.strip():
+                try:
+                    key_id = _normalize_api_key_id_or_raise("api_key.id", key_id_raw)
+                except HTTPException:
+                    key_id = str(uuid4())
+            else:
+                key_id = _legacy_api_key(key_value)
+
+            if key_id in seen_ids:
+                key_id = str(uuid4())
+
+            seen_values.add(key_value)
+            seen_ids.add(key_id)
+            normalized.append(StoredApiKey(key_id=key_id, key_value=key_value))
+        return normalized
+
     if isinstance(parsed, str):
         value = parsed.strip()
-        return [value] if value else []
-    return [decrypted]
+        if not value:
+            return []
+        return [StoredApiKey(key_id=_legacy_api_key(value), key_value=value)]
+    return [StoredApiKey(key_id=_legacy_api_key(decrypted), key_value=decrypted)]
 
 
 def _env_openai_api_keys() -> List[str]:
@@ -480,6 +610,7 @@ class ChatModelRecord:
     client_options: Dict[str, Any]
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
+    api_key_refs: List[ApiKeyRef]
     has_api_key: bool
     has_webhook_secret: bool
     is_active: bool
@@ -849,6 +980,7 @@ def _current_ts() -> str:
 
 
 def _to_public(item: StoredChatModel) -> ChatModelRecord:
+    api_key_items = _decrypt_api_keys_or_raise(item.encrypted_api_key) if item.encrypted_api_key else []
     return ChatModelRecord(
         model_id=item.model_id,
         provider=item.provider,
@@ -860,7 +992,8 @@ def _to_public(item: StoredChatModel) -> ChatModelRecord:
         client_options=dict(item.client_options),
         chat_create_options=dict(item.chat_create_options),
         responses_create_options=dict(item.responses_create_options),
-        has_api_key=bool(item.encrypted_api_key),
+        api_key_refs=_api_key_refs(api_key_items),
+        has_api_key=bool(api_key_items),
         has_webhook_secret=bool(item.encrypted_webhook_secret),
         is_active=item.is_active,
         is_default=item.is_default,
@@ -955,7 +1088,8 @@ def create_chat_model(
         responses_create_options,
     )
     requested_api_keys = _resolve_api_key_input_or_raise(api_key=api_key, api_keys=api_keys)
-    encrypted_api_key = _encrypt_api_keys_or_raise(requested_api_keys) if requested_api_keys else None
+    requested_api_key_items = _new_api_key_items(requested_api_keys) if requested_api_keys else []
+    encrypted_api_key = _encrypt_api_keys_or_raise(requested_api_key_items) if requested_api_key_items else None
     encrypted_webhook_secret = (
         _encrypt_secret_or_raise("webhook_secret", webhook_secret) if webhook_secret is not None else None
     )
@@ -1017,6 +1151,7 @@ def update_chat_model(
     api_key: Optional[str] = None,
     api_keys: Optional[List[str]] = None,
     append_api_keys: Optional[List[str]] = None,
+    remove_api_key_ids: Optional[List[str]] = None,
     clear_api_key: Optional[bool] = None,
     webhook_secret: Optional[str] = None,
     clear_webhook_secret: Optional[bool] = None,
@@ -1062,25 +1197,42 @@ def update_chat_model(
             responses_create_options,
         )
 
-    next_api_keys = _decrypt_api_keys_or_raise(existing.encrypted_api_key) if existing.encrypted_api_key else []
+    next_api_key_items = _decrypt_api_keys_or_raise(existing.encrypted_api_key) if existing.encrypted_api_key else []
     if clear_api_key is True:
-        next_api_keys = []
+        next_api_key_items = []
     requested_api_keys = _resolve_api_key_input_or_raise(api_key=api_key, api_keys=api_keys)
     if requested_api_keys is not None:
-        next_api_keys = requested_api_keys
+        next_api_key_items = _new_api_key_items(requested_api_keys)
     append_requested_api_keys = (
         _normalize_secret_list_or_raise("append_api_keys", append_api_keys)
         if append_api_keys is not None
         else None
     )
     if append_requested_api_keys:
-        seen_api_keys = set(next_api_keys)
+        seen_api_keys = {item.key_value for item in next_api_key_items}
         for item in append_requested_api_keys:
             if item in seen_api_keys:
                 continue
             seen_api_keys.add(item)
-            next_api_keys.append(item)
-    next_encrypted_api_key = _encrypt_api_keys_or_raise(next_api_keys) if next_api_keys else None
+            next_api_key_items.append(StoredApiKey(key_id=str(uuid4()), key_value=item))
+
+    remove_requested_api_key_ids = (
+        _normalize_api_key_id_list_or_raise("remove_api_key_ids", remove_api_key_ids)
+        if remove_api_key_ids is not None
+        else []
+    )
+    if remove_requested_api_key_ids:
+        remove_id_set = set(remove_requested_api_key_ids)
+        known_ids = {item.key_id for item in next_api_key_items}
+        unknown_ids = sorted(remove_id_set - known_ids)
+        if unknown_ids:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown api_key id(s): {', '.join(unknown_ids)}",
+            )
+        next_api_key_items = [item for item in next_api_key_items if item.key_id not in remove_id_set]
+
+    next_encrypted_api_key = _encrypt_api_keys_or_raise(next_api_key_items) if next_api_key_items else None
 
     next_encrypted_webhook_secret = existing.encrypted_webhook_secret
     if clear_webhook_secret is True:
@@ -1181,7 +1333,8 @@ def resolve_chat_model(model_id: Optional[str] = None) -> ResolvedChatModel:
     if not selected.is_active:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requested model is inactive.")
 
-    decrypted_api_keys = _decrypt_api_keys_or_raise(selected.encrypted_api_key) if selected.encrypted_api_key else []
+    decrypted_api_key_items = _decrypt_api_keys_or_raise(selected.encrypted_api_key) if selected.encrypted_api_key else []
+    decrypted_api_keys = _api_key_values(decrypted_api_key_items)
     if not decrypted_api_keys and selected.provider == "openai":
         decrypted_api_keys = _env_openai_api_keys()
     decrypted_api_key = decrypted_api_keys[0] if decrypted_api_keys else None
