@@ -49,7 +49,7 @@ def _required_env(env_name: str) -> str:
 def send_verification_email(*, recipient_email: str, recipient_name: str, verify_url: str) -> None:
     mode = _email_delivery_mode()
     if mode == "log":
-        logger.info(
+        logger.warning(
             "[AUTH] Verification link generated for %s <%s>: %s",
             recipient_name,
             recipient_email,
