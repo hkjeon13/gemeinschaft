@@ -212,6 +212,7 @@ async def admin_create_model(payload: AdminChatModelCreateSchema, access: Access
         chat_create_options=payload.chat_create_options,
         responses_create_options=payload.responses_create_options,
         api_key=payload.api_key,
+        api_keys=payload.api_keys,
         webhook_secret=payload.webhook_secret,
         is_active=payload.is_active,
         is_default=payload.is_default,
@@ -237,6 +238,8 @@ async def admin_update_model(
         and payload.chat_create_options is None
         and payload.responses_create_options is None
         and payload.api_key is None
+        and payload.api_keys is None
+        and payload.append_api_keys is None
         and payload.clear_api_key is None
         and payload.webhook_secret is None
         and payload.clear_webhook_secret is None
@@ -260,6 +263,8 @@ async def admin_update_model(
         chat_create_options=payload.chat_create_options,
         responses_create_options=payload.responses_create_options,
         api_key=payload.api_key,
+        api_keys=payload.api_keys,
+        append_api_keys=payload.append_api_keys,
         clear_api_key=payload.clear_api_key,
         webhook_secret=payload.webhook_secret,
         clear_webhook_secret=payload.clear_webhook_secret,

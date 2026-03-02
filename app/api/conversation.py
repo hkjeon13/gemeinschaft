@@ -331,6 +331,7 @@ def _chat_model(selected: ResolvedChatModel) -> AsyncOpenAIChatModel:
         return AsyncOpenAIChatModel(
             model=selected.model,
             api_key=selected.api_key,
+            api_keys=selected.api_keys,
             temperature=temperature,
             max_tokens=max_tokens,
             request_options=extra_options,

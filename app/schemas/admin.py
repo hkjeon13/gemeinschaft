@@ -56,6 +56,7 @@ class AdminChatModelCreateSchema(BaseModel):
     chat_create_options: Dict[str, Any] = Field(default_factory=dict)
     responses_create_options: Dict[str, Any] = Field(default_factory=dict)
     api_key: Optional[str] = Field(default=None, min_length=1)
+    api_keys: Optional[List[str]] = None
     webhook_secret: Optional[str] = Field(default=None, min_length=1)
     is_active: bool = Field(default=True)
     is_default: bool = Field(default=False)
@@ -72,6 +73,8 @@ class AdminChatModelUpdateSchema(BaseModel):
     chat_create_options: Optional[Dict[str, Any]] = None
     responses_create_options: Optional[Dict[str, Any]] = None
     api_key: Optional[str] = Field(default=None, min_length=1)
+    api_keys: Optional[List[str]] = None
+    append_api_keys: Optional[List[str]] = None
     clear_api_key: Optional[bool] = None
     webhook_secret: Optional[str] = Field(default=None, min_length=1)
     clear_webhook_secret: Optional[bool] = None

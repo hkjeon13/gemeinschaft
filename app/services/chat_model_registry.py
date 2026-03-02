@@ -375,6 +375,79 @@ def _decrypt_secret_or_raise(field_name: str, token: str) -> str:
         )
 
 
+def _normalize_secret_list_or_raise(field_name: str, values: Any) -> List[str]:
+    if not isinstance(values, list):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{field_name} must be a list of non-empty strings.",
+        )
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, str):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must be a list of non-empty strings.",
+            )
+        secret = item.strip()
+        if not secret:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must be a list of non-empty strings.",
+            )
+        if secret in seen:
+            continue
+        seen.add(secret)
+        normalized.append(secret)
+    return normalized
+
+
+def _resolve_api_key_input_or_raise(*, api_key: Optional[str], api_keys: Optional[List[str]]) -> Optional[List[str]]:
+    if api_key is not None and api_keys is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Use either api_key or api_keys, not both.",
+        )
+    if api_keys is not None:
+        return _normalize_secret_list_or_raise("api_keys", api_keys)
+    if api_key is not None:
+        return [_normalize_nonempty_or_raise("api_key", api_key)]
+    return None
+
+
+def _encrypt_api_keys_or_raise(api_keys: List[str]) -> str:
+    serialized = json.dumps(api_keys)
+    return _encrypt_secret_or_raise("api_key", serialized)
+
+
+def _decrypt_api_keys_or_raise(token: str) -> List[str]:
+    decrypted = _decrypt_secret_or_raise("api_key", token).strip()
+    if not decrypted:
+        return []
+
+    try:
+        parsed = json.loads(decrypted)
+    except ValueError:
+        return [decrypted]
+
+    if isinstance(parsed, list):
+        return _normalize_secret_list_or_raise("api_key", parsed)
+    if isinstance(parsed, str):
+        value = parsed.strip()
+        return [value] if value else []
+    return [decrypted]
+
+
+def _env_openai_api_keys() -> List[str]:
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not env_key:
+        return []
+    if "\n" in env_key:
+        return _normalize_secret_list_or_raise("OPENAI_API_KEY", [line for line in env_key.splitlines() if line.strip()])
+    return [env_key]
+
+
 @dataclass
 class StoredChatModel:
     model_id: str
@@ -428,6 +501,7 @@ class ResolvedChatModel:
     chat_create_options: Dict[str, Any]
     responses_create_options: Dict[str, Any]
     api_key: Optional[str]
+    api_keys: List[str]
 
 
 class ChatModelStore:
@@ -857,6 +931,7 @@ def create_chat_model(
     chat_create_options: Dict[str, Any],
     responses_create_options: Dict[str, Any],
     api_key: Optional[str],
+    api_keys: Optional[List[str]],
     webhook_secret: Optional[str],
     is_active: bool,
     is_default: bool,
@@ -879,7 +954,8 @@ def create_chat_model(
         normalized_provider,
         responses_create_options,
     )
-    encrypted_api_key = _encrypt_secret_or_raise("api_key", api_key) if api_key is not None else None
+    requested_api_keys = _resolve_api_key_input_or_raise(api_key=api_key, api_keys=api_keys)
+    encrypted_api_key = _encrypt_api_keys_or_raise(requested_api_keys) if requested_api_keys else None
     encrypted_webhook_secret = (
         _encrypt_secret_or_raise("webhook_secret", webhook_secret) if webhook_secret is not None else None
     )
@@ -939,6 +1015,8 @@ def update_chat_model(
     chat_create_options: Optional[Dict[str, Any]] = None,
     responses_create_options: Optional[Dict[str, Any]] = None,
     api_key: Optional[str] = None,
+    api_keys: Optional[List[str]] = None,
+    append_api_keys: Optional[List[str]] = None,
     clear_api_key: Optional[bool] = None,
     webhook_secret: Optional[str] = None,
     clear_webhook_secret: Optional[bool] = None,
@@ -984,11 +1062,25 @@ def update_chat_model(
             responses_create_options,
         )
 
-    next_encrypted_api_key = existing.encrypted_api_key
+    next_api_keys = _decrypt_api_keys_or_raise(existing.encrypted_api_key) if existing.encrypted_api_key else []
     if clear_api_key is True:
-        next_encrypted_api_key = None
-    if api_key is not None:
-        next_encrypted_api_key = _encrypt_secret_or_raise("api_key", api_key)
+        next_api_keys = []
+    requested_api_keys = _resolve_api_key_input_or_raise(api_key=api_key, api_keys=api_keys)
+    if requested_api_keys is not None:
+        next_api_keys = requested_api_keys
+    append_requested_api_keys = (
+        _normalize_secret_list_or_raise("append_api_keys", append_api_keys)
+        if append_api_keys is not None
+        else None
+    )
+    if append_requested_api_keys:
+        seen_api_keys = set(next_api_keys)
+        for item in append_requested_api_keys:
+            if item in seen_api_keys:
+                continue
+            seen_api_keys.add(item)
+            next_api_keys.append(item)
+    next_encrypted_api_key = _encrypt_api_keys_or_raise(next_api_keys) if next_api_keys else None
 
     next_encrypted_webhook_secret = existing.encrypted_webhook_secret
     if clear_webhook_secret is True:
@@ -1089,11 +1181,10 @@ def resolve_chat_model(model_id: Optional[str] = None) -> ResolvedChatModel:
     if not selected.is_active:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Requested model is inactive.")
 
-    decrypted_api_key = _decrypt_secret_or_raise("api_key", selected.encrypted_api_key) if selected.encrypted_api_key else None
-    if not decrypted_api_key and selected.provider == "openai":
-        env_key = os.getenv("OPENAI_API_KEY", "").strip()
-        if env_key:
-            decrypted_api_key = env_key
+    decrypted_api_keys = _decrypt_api_keys_or_raise(selected.encrypted_api_key) if selected.encrypted_api_key else []
+    if not decrypted_api_keys and selected.provider == "openai":
+        decrypted_api_keys = _env_openai_api_keys()
+    decrypted_api_key = decrypted_api_keys[0] if decrypted_api_keys else None
 
     resolved_client_options = dict(selected.client_options)
     if selected.encrypted_webhook_secret:
@@ -1114,4 +1205,5 @@ def resolve_chat_model(model_id: Optional[str] = None) -> ResolvedChatModel:
         chat_create_options=dict(selected.chat_create_options),
         responses_create_options=dict(selected.responses_create_options),
         api_key=decrypted_api_key,
+        api_keys=decrypted_api_keys,
     )

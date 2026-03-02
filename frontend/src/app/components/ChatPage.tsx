@@ -104,6 +104,13 @@ function formatDate(iso: string) {
   return d.toLocaleDateString('ko-KR', { month: 'short', day: 'numeric' });
 }
 
+function toErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
+  }
+  return fallback;
+}
+
 // ─── 아바타 ───────────────────────────────────────────────────────────────────
 
 const AVATAR_COLORS = [
@@ -166,13 +173,15 @@ function ContinueSettingsModal({
   const [minInterval, setMinInterval] = useState(1);
   const [maxInterval, setMaxInterval] = useState(10);
   const [maxTurns, setMaxTurns] = useState(20);
+  const [validationError, setValidationError] = useState('');
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (minInterval > maxInterval) {
-      alert('최소 간격은 최대 간격보다 클 수 없습니다.');
+      setValidationError('최소 간격은 최대 간격보다 클 수 없습니다.');
       return;
     }
+    setValidationError('');
     onConfirm({ minInterval, maxInterval, maxTurns });
   };
 
@@ -210,9 +219,12 @@ function ContinueSettingsModal({
 
         <form onSubmit={handleSubmit} className="px-5 py-4 space-y-4">
           <p className="text-xs text-gray-400 leading-relaxed">
-            현재 대화의 마지막 맥락으로 답변을 자동으로 이어서 생성���니다.<br />
+            현재 대화의 마지막 맥락으로 답변을 자동으로 이어서 생성합니다.<br />
             최대 턴 도달 시 자동으로 중단됩니다.
           </p>
+          {validationError && (
+            <p className="text-xs text-red-600">{validationError}</p>
+          )}
 
           {/* 응답 간격 */}
           <div>
@@ -225,7 +237,10 @@ function ContinueSettingsModal({
                   min={0}
                   max={300}
                   value={minInterval}
-                  onChange={(e) => setMinInterval(Number(e.target.value))}
+                  onChange={(e) => {
+                    setValidationError('');
+                    setMinInterval(Number(e.target.value));
+                  }}
                   className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-400 text-center"
                 />
               </div>
@@ -236,7 +251,10 @@ function ContinueSettingsModal({
                   min={0}
                   max={300}
                   value={maxInterval}
-                  onChange={(e) => setMaxInterval(Number(e.target.value))}
+                  onChange={(e) => {
+                    setValidationError('');
+                    setMaxInterval(Number(e.target.value));
+                  }}
                   className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-400 text-center"
                 />
               </div>
@@ -253,7 +271,10 @@ function ContinueSettingsModal({
                 min={1}
                 max={200}
                 value={maxTurns}
-                onChange={(e) => setMaxTurns(Number(e.target.value))}
+                onChange={(e) => {
+                  setValidationError('');
+                  setMaxTurns(Number(e.target.value));
+                }}
                 className="w-24 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-green-400 text-center"
               />
               <p className="text-xs text-gray-400">assistant 응답이 이 수에 도달하면 자동 중단</p>
@@ -308,12 +329,16 @@ function ManageModelsModal({
   const [showAdd, setShowAdd] = useState(false);
   const [removing, setRemoving] = useState<string | null>(null);
   const [adding, setAdding] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState('');
 
   useEffect(() => {
     setLoadingAvail(true);
     getModels()
       .then((list) => setAvailableModels(list.filter((m) => m.is_active)))
-      .catch(console.error)
+      .catch((error) => {
+        console.error(error);
+        setOperationError('모델 목록 조회에 실패했습니다.');
+      })
       .finally(() => setLoadingAvail(false));
   }, [conversationId]);
 
@@ -327,9 +352,10 @@ function ManageModelsModal({
     try {
       const updated = await removeConversationRoomModel(conversationId, modelId);
       onModelsChange(updated);
+      setOperationError('');
     } catch (e) {
       console.error(e);
-      alert('모델 제거에 실패했습니다.');
+      setOperationError('모델 제거에 실패했습니다.');
     } finally {
       setRemoving(null);
     }
@@ -340,9 +366,10 @@ function ManageModelsModal({
     try {
       const updated = await addConversationRoomModel(conversationId, modelId);
       onModelsChange(updated);
+      setOperationError('');
     } catch (e) {
       console.error(e);
-      alert('모델 추가에 실패했습니다.');
+      setOperationError('모델 추가에 실패했습니다.');
     } finally {
       setAdding(null);
     }
@@ -367,6 +394,11 @@ function ManageModelsModal({
             <svg viewBox="0 0 20 20" fill="currentColor" className="w-4 h-4"><path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" /></svg>
           </button>
         </div>
+        {operationError && (
+          <div className="mx-5 mt-3 rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-700">
+            {operationError}
+          </div>
+        )}
 
         <ul className="max-h-60 overflow-y-auto divide-y divide-gray-50">
           {displayModels.length === 0 ? (
@@ -463,6 +495,7 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [operationError, setOperationError] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -471,8 +504,10 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
         setModels(list);
         setCurrentDefault(def);
         setSelected(def.source === 'user' ? def.model_id : null);
+        setOperationError('');
       } catch (e) {
         console.error(e);
+        setOperationError('기본 모델 정보를 불러오지 못했습니다.');
       } finally {
         setLoading(false);
       }
@@ -484,10 +519,11 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
     setSaving(true);
     try {
       await setConversationDefaultModel(selected);
+      setOperationError('');
       onClose();
     } catch (e) {
       console.error(e);
-      alert('기본 모델 설정에 실패했습니다.');
+      setOperationError('기본 모델 설정에 실패했습니다.');
     } finally {
       setSaving(false);
     }
@@ -497,10 +533,11 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
     setSaving(true);
     try {
       await deleteConversationDefaultModel();
+      setOperationError('');
       onClose();
     } catch (e) {
       console.error(e);
-      alert('기본 모델 해제에 실패했습니다.');
+      setOperationError('기본 모델 해제에 실패했습니다.');
     } finally {
       setSaving(false);
     }
@@ -559,6 +596,11 @@ function DefaultModelModal({ onClose }: { onClose: () => void }) {
               </button>
             );
           })}
+          {operationError && (
+            <div className="rounded-lg border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-700">
+              {operationError}
+            </div>
+          )}
         </div>
 
         <div className="px-5 py-4 border-t border-gray-100 flex items-center justify-between gap-3">
@@ -920,7 +962,9 @@ export function ChatPage() {
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [isContinuing, setIsContinuing] = useState(false);
   const [showContinueModal, setShowContinueModal] = useState(false);
+  const [notice, setNotice] = useState('');
   const continueRunningRef = useRef(false);
+  const noticeTimerRef = useRef<number | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -928,6 +972,24 @@ export function ChatPage() {
 
   useEffect(() => { scrollToBottom(); }, [currentConversation?.messages, sending]);
   useEffect(() => { loadInitialData(); }, []);
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+      }
+    };
+  }, []);
+
+  const showNotice = (message: string) => {
+    setNotice(message);
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice('');
+      noticeTimerRef.current = null;
+    }, 3500);
+  };
 
   const loadInitialData = async () => {
     setLoading(true);
@@ -937,6 +999,7 @@ export function ChatPage() {
       setConversations(await getConversationList());
     } catch (err) {
       if (err instanceof Error && err.message.includes('401')) navigate('/login');
+      else showNotice('초기 데이터를 불러오지 못했습니다.');
     } finally {
       setLoading(false);
     }
@@ -994,7 +1057,7 @@ export function ChatPage() {
       }
     } catch (err) {
       console.error('Failed to hide conversation:', err);
-      alert('대화 삭제에 실패했습니다.');
+      showNotice('대화 삭제에 실패했습니다.');
     } finally {
       setDeletingId(null);
     }
@@ -1058,7 +1121,7 @@ export function ChatPage() {
       console.error('Failed to send message:', err);
       setCurrentConversation((prev) => prev ? { ...prev, messages: prev.messages.filter((m) => !m._optimistic) } : prev);
       setInputMessage(text);
-      alert('메시지 전송에 실패했습니다.');
+      showNotice('메시지 전송에 실패했습니다.');
     } finally {
       setSending(false);
       setPendingModel(null);
@@ -1081,7 +1144,7 @@ export function ChatPage() {
       await updateConversationTitle(convId, newTitle);
     } catch (err) {
       console.error('Failed to update title:', err);
-      alert('제목 수정에 실패했습니다.');
+      showNotice('제목 수정에 실패했습니다.');
       setConversations(await getConversationList());
     }
   };
@@ -1093,6 +1156,15 @@ export function ChatPage() {
 
   const handleStartContinue = async (settings: ContinueSettings) => {
     if (!selectedConversationId) return;
+    const candidateModelIds = new Set(
+      (Array.isArray(roomModels) ? roomModels : [])
+        .map((item) => item.model_id)
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    );
+    if (candidateModelIds.size < 2) {
+      showNotice('연속 대화는 대화방 모델이 최소 2개 이상일 때 시작할 수 있습니다.');
+      return;
+    }
     const convId = selectedConversationId;
     continueRunningRef.current = true;
     setIsContinuing(true);
@@ -1120,8 +1192,8 @@ export function ChatPage() {
             console.log('[Continue] max_turns reached, stopping loop');
           } else {
             console.error('[Continue] loop error:', err);
-            const msg = err instanceof Error ? err.message : String(err);
-            alert(`연속 대화 오류: ${msg}`);
+            const msg = toErrorMessage(err, '연속 대화 실행 중 오류가 발생했습니다.');
+            showNotice(`연속 대화 오류: ${msg}`);
           }
           return;
         }
@@ -1156,6 +1228,11 @@ export function ChatPage() {
 
   return (
     <div className="flex h-screen overflow-hidden">
+      {notice && (
+        <div className="fixed left-1/2 top-4 z-[90] -translate-x-1/2 rounded-xl border border-red-100 bg-red-50 px-4 py-2 text-sm text-red-700 shadow-sm">
+          {notice}
+        </div>
+      )}
       {/* ── 좌측 사이드바 ── */}
       <aside className="w-72 flex flex-col flex-shrink-0 bg-[#f3f4f6] border-r border-gray-200">
         {/* 헤더 */}

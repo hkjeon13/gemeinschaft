@@ -171,6 +171,8 @@ export function AdminPage() {
   const [activeTab, setActiveTab] = useState<Tab>('users');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [actionMessage, setActionMessage] = useState('');
+  const [pendingDeleteModelId, setPendingDeleteModelId] = useState<string | null>(null);
 
   const [users, setUsers] = useState<User[]>([]);
   const [editingUser, setEditingUser] = useState<string | null>(null);
@@ -208,25 +210,31 @@ export function AdminPage() {
   };
 
   const handleSaveRole = async (username: string) => {
+    setActionMessage('');
     try {
       await updateUserRole(username, selectedRole);
       await loadData(); setEditingUser(null);
+      setActionMessage('권한이 업데이트되었습니다.');
     } catch (err) {
       if (err instanceof Error) {
-        if (err.message.includes('400')) alert('권한 변경에 실패했습니다. 마지막 관리자의 권한은 변경할 수 없습니다.');
-        else if (err.message.includes('404')) alert('사용자를 찾을 수 없습니다.');
-        else alert('권한 변경 중 오류가 발생했습니다.');
+        if (err.message.includes('400')) setActionMessage('권한 변경에 실패했습니다. 마지막 관리자의 권한은 변경할 수 없습니다.');
+        else if (err.message.includes('404')) setActionMessage('사용자를 찾을 수 없습니다.');
+        else setActionMessage('권한 변경 중 오류가 발생했습니다.');
       }
     }
   };
 
   const handleNewModel = () => {
     setEditingModel(null); setEditingModelData(null);
+    setPendingDeleteModelId(null);
+    setActionMessage('');
     setModelForm(emptyModelForm); setShowModelForm(true);
   };
 
   const handleEditModel = (model: Model) => {
     setEditingModel(model.model_id); setEditingModelData(model);
+    setPendingDeleteModelId(null);
+    setActionMessage('');
     setModelForm({
       model_id: model.model_id, provider: model.provider,
       openai_api: model.openai_api, model: model.model,
@@ -244,11 +252,15 @@ export function AdminPage() {
 
   const parseJsonField = (raw: string, label: string): Record<string, unknown> | null => {
     try { return JSON.parse(raw); }
-    catch { alert(`${label}는 유효한 JSON이어야 합니다.`); return null; }
+    catch {
+      setActionMessage(`${label}는 유효한 JSON이어야 합니다.`);
+      return null;
+    }
   };
 
   const handleSaveModel = async (e: React.FormEvent) => {
     e.preventDefault();
+    setActionMessage('');
     const parameters = parseJsonField(modelForm.parameters, 'Parameters'); if (!parameters) return;
     const clientOptions = parseJsonField(modelForm.client_options, 'Client Options'); if (!clientOptions) return;
     const chatCreateOptions = parseJsonField(modelForm.chat_create_options, 'Create Options (chat)'); if (!chatCreateOptions) return;
@@ -282,28 +294,39 @@ export function AdminPage() {
       }
       setShowModelForm(false);
       await loadData();
+      setActionMessage(editingModel ? '모델이 수정되었습니다.' : '모델이 등록되었습니다.');
     } catch (err) {
       if (err instanceof Error) {
-        if (err.message.includes('409')) alert('이미 존재하는 Model ID입니다.');
+        if (err.message.includes('409')) setActionMessage('이미 존재하는 Model ID입니다.');
         else if (err.message.includes('400')) {
           const match = err.message.match(/API Error 400: (.+)/);
           try {
             const body = match ? JSON.parse(match[1]) : null;
-            alert(`검증 오류: ${body?.detail ?? match?.[1] ?? '입력 데이터 검증에 실패했습니다.'}`);
-          } catch { alert(`검증 오류: ${match?.[1] ?? '입력 데이터 검증에 실패했습니다.'}`); }
-        } else if (err.message.includes('422')) alert('입력 데이터가 유효하지 않습니다. 필드 타입을 확인하세요.');
-        else alert('모델 저장 중 오류가 발생했습니다.');
+            setActionMessage(`검증 오류: ${body?.detail ?? match?.[1] ?? '입력 데이터 검증에 실패했습니다.'}`);
+          } catch {
+            setActionMessage(`검증 오류: ${match?.[1] ?? '입력 데이터 검증에 실패했습니다.'}`);
+          }
+        } else if (err.message.includes('422')) setActionMessage('입력 데이터가 유효하지 않습니다. 필드 타입을 확인하세요.');
+        else setActionMessage('모델 저장 중 오류가 발생했습니다.');
       }
     }
   };
 
   const handleDeleteModel = async (modelId: string) => {
-    if (!confirm(`모델 "${modelId}"를 삭제하시겠습니까?`)) return;
+    if (pendingDeleteModelId !== modelId) {
+      setPendingDeleteModelId(modelId);
+      setActionMessage(`모델 "${modelId}"를 삭제하려면 삭제를 한 번 더 누르세요.`);
+      return;
+    }
+    setActionMessage('');
     try {
       await deleteModel(modelId); await loadData();
+      setPendingDeleteModelId(null);
+      setActionMessage(`모델 "${modelId}"가 삭제되었습니다.`);
     } catch (err) {
       if (err instanceof Error)
-        alert(err.message.includes('400') ? '마지막 남은 모델은 삭제할 수 없습니다.' : '모델 삭제 중 오류가 발생했습니다.');
+        setActionMessage(err.message.includes('400') ? '마지막 남은 모델은 삭제할 수 없습니다.' : '모델 삭제 중 오류가 발생했습니다.');
+      setPendingDeleteModelId(null);
     }
   };
 
@@ -432,6 +455,11 @@ export function AdminPage() {
               <p className="text-sm text-red-700">{error}</p>
             </div>
           )}
+          {actionMessage && (
+            <div className="mb-4 rounded-xl border border-amber-100 bg-amber-50 px-4 py-3">
+              <p className="text-sm text-amber-800">{actionMessage}</p>
+            </div>
+          )}
 
           {/* ── 사용자 관리 ── */}
           {activeTab === 'users' && (
@@ -555,7 +583,16 @@ export function AdminPage() {
                         <td className="px-4 py-3.5 whitespace-nowrap text-sm">
                           <div className="flex gap-2">
                             <button onClick={() => handleEditModel(model)} className="px-2.5 py-1 rounded-lg text-xs text-indigo-600 hover:bg-indigo-50 transition-colors">수정</button>
-                            <button onClick={() => handleDeleteModel(model.model_id)} className="px-2.5 py-1 rounded-lg text-xs text-red-500 hover:bg-red-50 transition-colors">삭제</button>
+                            <button
+                              onClick={() => handleDeleteModel(model.model_id)}
+                              className={`px-2.5 py-1 rounded-lg text-xs transition-colors ${
+                                pendingDeleteModelId === model.model_id
+                                  ? 'bg-red-500 text-white hover:bg-red-600'
+                                  : 'text-red-500 hover:bg-red-50'
+                              }`}
+                            >
+                              {pendingDeleteModelId === model.model_id ? '삭제 확인' : '삭제'}
+                            </button>
                           </div>
                         </td>
                       </tr>

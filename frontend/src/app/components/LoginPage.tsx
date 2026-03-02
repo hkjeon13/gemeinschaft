@@ -26,6 +26,8 @@ export function LoginPage() {
           setError('로그인 시도 횟수가 초과되었습니다. 잠시 후 다시 시도해주세요.');
         } else if (err.message.includes('403')) {
           setError('접근이 거부되었습니다. CSRF 또는 Origin 정책 위반입니다.');
+        } else if (err.message.includes('Failed to fetch')) {
+          setError('서버 연결에 실패했습니다. CORS/네트워크/서버 상태를 확인해주세요.');
         } else {
           setError('로그인 중 오류가 발생했습니다. 다시 시도해주세요.');
         }

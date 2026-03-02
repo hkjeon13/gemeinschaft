@@ -2,7 +2,7 @@ import os
 import base64
 import mimetypes
 from pathlib import Path
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional, TypeVar
 
 from openai import AsyncOpenAI
 
@@ -80,6 +80,9 @@ _OPENAI_RESPONSES_CREATE_ALLOWED_KEYS = {
 _OPENAI_RESPONSES_CREATE_RESERVED_KEYS = {"input", "model", "stream"}
 _TEXT_CONTENT_TYPES = {"text", "input_text", "output_text"}
 _IMAGE_CONTENT_TYPES = {"image_url", "input_image", "output_image"}
+_API_KEY_FAILOVER_STATUS_CODES = {401, 403, 429}
+_FAILOVER_ERROR_NAMES = {"ratelimiterror", "authenticationerror", "permissiondeniederror"}
+_T = TypeVar("_T")
 
 
 class AsyncOpenAIChatModel:
@@ -88,6 +91,7 @@ class AsyncOpenAIChatModel:
         *,
         model: Optional[str] = None,
         api_key: Optional[str] = None,
+        api_keys: Optional[list[str]] = None,
         system_prompt: str = "",
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
@@ -98,23 +102,28 @@ class AsyncOpenAIChatModel:
         responses_create_options: Optional[dict[str, Any]] = None,
         client: Optional[AsyncOpenAI] = None,
     ) -> None:
-        resolved_api_key = (api_key or os.getenv("OPENAI_API_KEY", "")).strip()
         normalized_client_options = dict(client_options or {})
         if "api_key" in normalized_client_options:
             raise ValueError("Do not set api_key in client_options; use api_key field.")
 
-        if client is None and not resolved_api_key:
-            raise ValueError("OPENAI_API_KEY is required.")
-
         if client is None:
-            openai_kwargs = dict(normalized_client_options)
-            openai_kwargs["api_key"] = resolved_api_key
-            try:
-                self.client = AsyncOpenAI(**openai_kwargs)
-            except TypeError as exc:
-                raise ValueError(f"Invalid OpenAI client options: {exc}") from exc
+            resolved_api_keys = self._resolve_api_keys(api_key=api_key, api_keys=api_keys)
+            if not resolved_api_keys:
+                raise ValueError("OPENAI_API_KEY is required.")
+            self._clients = []
+            for key in resolved_api_keys:
+                openai_kwargs = dict(normalized_client_options)
+                openai_kwargs["api_key"] = key
+                try:
+                    self._clients.append(AsyncOpenAI(**openai_kwargs))
+                except TypeError as exc:
+                    raise ValueError(f"Invalid OpenAI client options: {exc}") from exc
+            self.api_keys = list(resolved_api_keys)
         else:
-            self.client = client
+            self._clients = [client]
+            self.api_keys = []
+
+        self.client = self._clients[0]
 
         normalized_api = openai_api.strip().lower()
         if normalized_api not in {"chat.completions", "responses"}:
@@ -166,50 +175,125 @@ class AsyncOpenAIChatModel:
 
     async def _generate_messages_chat(self, messages: list[dict[str, Any]]) -> str:
         payload = self._chat_payload(messages=messages, stream=False)
-        completion = await self.client.chat.completions.create(**payload)
+        return await self._run_with_api_key_failover(lambda client: self._generate_messages_chat_once(client, payload))
+
+    async def _stream_messages_chat(self, messages: list[dict[str, Any]]) -> AsyncIterator[str]:
+        payload = self._chat_payload(messages=messages, stream=True)
+        for index, client in enumerate(self._clients):
+            saw_output = False
+            try:
+                stream = await client.chat.completions.create(**payload)
+                async for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    text = self._to_text(chunk.choices[0].delta.content)
+                    if text:
+                        saw_output = True
+                        yield text
+                return
+            except Exception as exc:
+                if saw_output:
+                    raise
+                can_failover = index < len(self._clients) - 1 and self._is_api_key_failover_error(exc)
+                if can_failover:
+                    continue
+                raise
+
+    async def _generate_messages_responses(self, messages: list[dict[str, Any]]) -> str:
+        payload = self._responses_payload(messages=messages, stream=False)
+        return await self._run_with_api_key_failover(lambda client: self._generate_messages_responses_once(client, payload))
+
+    async def _stream_messages_responses(self, messages: list[dict[str, Any]]) -> AsyncIterator[str]:
+        payload = self._responses_payload(messages=messages, stream=True)
+        for index, client in enumerate(self._clients):
+            saw_output = False
+            completed_response: Any = None
+            try:
+                stream = await client.responses.create(**payload)
+                async for event in stream:
+                    event_type = self._event_field(event, "type")
+                    if event_type == "response.output_text.delta":
+                        delta = self._event_field(event, "delta")
+                        text = self._to_text(delta)
+                        if text:
+                            saw_output = True
+                            yield text
+                        continue
+
+                    if event_type == "response.completed":
+                        completed_response = self._event_field(event, "response")
+
+                if not saw_output and completed_response is not None:
+                    fallback = self._response_to_text(completed_response)
+                    if fallback:
+                        saw_output = True
+                        yield fallback
+                return
+            except Exception as exc:
+                if saw_output:
+                    raise
+                can_failover = index < len(self._clients) - 1 and self._is_api_key_failover_error(exc)
+                if can_failover:
+                    continue
+                raise
+
+    async def _generate_messages_chat_once(self, client: AsyncOpenAI, payload: dict[str, Any]) -> str:
+        completion = await client.chat.completions.create(**payload)
         if not completion.choices:
             return ""
         return self._to_text(completion.choices[0].message.content).strip()
 
-    async def _stream_messages_chat(self, messages: list[dict[str, Any]]) -> AsyncIterator[str]:
-        payload = self._chat_payload(messages=messages, stream=True)
-        stream = await self.client.chat.completions.create(**payload)
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            text = self._to_text(chunk.choices[0].delta.content)
-            if text:
-                yield text
-
-    async def _generate_messages_responses(self, messages: list[dict[str, Any]]) -> str:
-        payload = self._responses_payload(messages=messages, stream=False)
-        response = await self.client.responses.create(**payload)
+    async def _generate_messages_responses_once(self, client: AsyncOpenAI, payload: dict[str, Any]) -> str:
+        response = await client.responses.create(**payload)
         return self._response_to_text(response).strip()
 
-    async def _stream_messages_responses(self, messages: list[dict[str, Any]]) -> AsyncIterator[str]:
-        payload = self._responses_payload(messages=messages, stream=True)
-        stream = await self.client.responses.create(**payload)
+    async def _run_with_api_key_failover(self, operation: Callable[[AsyncOpenAI], Awaitable[_T]]) -> _T:
+        last_exc: Exception | None = None
+        for index, client in enumerate(self._clients):
+            try:
+                return await operation(client)
+            except Exception as exc:
+                last_exc = exc
+                can_failover = index < len(self._clients) - 1 and self._is_api_key_failover_error(exc)
+                if can_failover:
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("No OpenAI client is configured.")
 
-        saw_delta = False
-        completed_response: Any = None
+    def _resolve_api_keys(self, *, api_key: Optional[str], api_keys: Optional[list[str]]) -> list[str]:
+        candidates: list[str] = []
+        if api_key is not None:
+            candidates.append(api_key)
+        if api_keys is not None:
+            candidates.extend(api_keys)
 
-        async for event in stream:
-            event_type = self._event_field(event, "type")
-            if event_type == "response.output_text.delta":
-                delta = self._event_field(event, "delta")
-                text = self._to_text(delta)
-                if text:
-                    saw_delta = True
-                    yield text
+        if not candidates:
+            env_key = os.getenv("OPENAI_API_KEY", "").strip()
+            if env_key:
+                candidates.append(env_key)
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in candidates:
+            if not isinstance(raw, str):
+                raise ValueError("api_keys must contain strings.")
+            secret = raw.strip()
+            if not secret or secret in seen:
                 continue
+            seen.add(secret)
+            normalized.append(secret)
+        return normalized
 
-            if event_type == "response.completed":
-                completed_response = self._event_field(event, "response")
-
-        if not saw_delta and completed_response is not None:
-            fallback = self._response_to_text(completed_response)
-            if fallback:
-                yield fallback
+    def _is_api_key_failover_error(self, exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int) and status_code in _API_KEY_FAILOVER_STATUS_CODES:
+            return True
+        error_name = exc.__class__.__name__.strip().lower()
+        if error_name in _FAILOVER_ERROR_NAMES:
+            return True
+        return False
 
     def _build_messages(self, *, user_input: str, system_prompt: Optional[str]) -> list[dict[str, Any]]:
         text = user_input.strip()
