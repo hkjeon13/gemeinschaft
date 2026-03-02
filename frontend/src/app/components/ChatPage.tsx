@@ -264,7 +264,7 @@ function ContinueSettingsModal({
 
         <form onSubmit={handleSubmit} className="px-5 py-4 space-y-4">
           <p className="text-xs text-gray-400 leading-relaxed">
-            현재 대화의 마지막 맥락으로 답변을 자동으로 이어서 생성���니다.<br />
+            현재 대화의 마지막 맥락으로 답변을 자동으로 이어서 생성합니다.<br />
             최대 턴 도달 시 자동으로 중단됩니다.
           </p>
 
@@ -1338,6 +1338,33 @@ export function ChatPage() {
     if (!currentUser || !selectedConversationId) return;
     let cancelled = false;
 
+    const loadStatusOnce = async () => {
+      try {
+        const status = await getContinueConversationStatus(selectedConversationId);
+        if (cancelled) return;
+        if (status.running) {
+          setContinuingConversationId(selectedConversationId);
+          return;
+        }
+        if (status.active_conversation_id) {
+          setContinuingConversationId(status.active_conversation_id);
+          return;
+        }
+        setContinuingConversationId(null);
+      } catch {
+        if (!cancelled) {
+          setContinuingConversationId(null);
+        }
+      }
+    };
+
+    loadStatusOnce();
+    return () => { cancelled = true; };
+  }, [currentUser, selectedConversationId]);
+  useEffect(() => {
+    if (!currentUser || !selectedConversationId || !continuingConversationId) return;
+    let cancelled = false;
+
     const refreshStatus = async () => {
       try {
         const status = await getContinueConversationStatus(selectedConversationId);
@@ -1359,12 +1386,12 @@ export function ChatPage() {
     };
 
     refreshStatus();
-    const timer = window.setInterval(refreshStatus, 2500);
+    const timer = window.setInterval(refreshStatus, 10000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [currentUser, selectedConversationId]);
+  }, [currentUser, selectedConversationId, continuingConversationId]);
   useEffect(() => {
     if (!currentUser || !selectedConversationId || continuingConversationId !== selectedConversationId) return;
     let cancelled = false;
@@ -1391,7 +1418,7 @@ export function ChatPage() {
     };
 
     refreshConversation();
-    const timer = window.setInterval(refreshConversation, 2200);
+    const timer = window.setInterval(refreshConversation, 10000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
