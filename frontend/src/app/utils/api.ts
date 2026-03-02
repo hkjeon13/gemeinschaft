@@ -383,6 +383,10 @@ export async function getModels() {
     client_options: Record<string, unknown>;
     chat_create_options: Record<string, unknown>;
     responses_create_options: Record<string, unknown>;
+    api_key_refs: Array<{
+      key_id: string;
+      masked_key: string;
+    }>;
     has_api_key: boolean;
     has_webhook_secret: boolean;
     is_active: boolean;
@@ -432,6 +436,7 @@ export async function updateModel(
     api_key?: string;
     api_keys?: string[];
     append_api_keys?: string[];
+    remove_api_key_ids?: string[];
     webhook_secret?: string;
     clear_api_key?: boolean;
     clear_webhook_secret?: boolean;

@@ -29,6 +29,10 @@ interface Model {
   client_options: Record<string, unknown>;
   chat_create_options: Record<string, unknown>;
   responses_create_options: Record<string, unknown>;
+  api_key_refs: Array<{
+    key_id: string;
+    masked_key: string;
+  }>;
   has_api_key: boolean;
   has_webhook_secret: boolean;
   is_active: boolean;
@@ -52,6 +56,7 @@ interface ModelForm {
   api_keys: string[];
   use_multi_keys: boolean;
   append_api_keys: string[];
+  remove_api_key_ids: string[];
   webhook_secret: string;
   clear_api_key: boolean;
   clear_webhook_secret: boolean;
@@ -77,6 +82,7 @@ const emptyModelForm: ModelForm = {
   api_keys: [],
   use_multi_keys: false,
   append_api_keys: [],
+  remove_api_key_ids: [],
   webhook_secret: '',
   clear_api_key: false,
   clear_webhook_secret: false,
@@ -360,6 +366,19 @@ function ModelDetailPopup({
               🔐 Webhook {model.has_webhook_secret ? '설정됨' : '미설정'}
             </span>
           </div>
+          {model.api_key_refs.length > 0 && (
+            <div>
+              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">API Key 목록</p>
+              <div className="space-y-1">
+                {model.api_key_refs.map((ref) => (
+                  <div key={ref.key_id} className="flex items-center justify-between gap-2 rounded-lg border border-gray-100 bg-gray-50 px-2 py-1.5">
+                    <span className="text-[10px] text-gray-700 font-mono">{ref.masked_key}</span>
+                    <span className="text-[10px] text-gray-400 font-mono truncate max-w-[220px]">{ref.key_id}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* JSON 파라미터 (비어있지 않은 것만) */}
           {!isEmpty(model.parameters) && (
@@ -456,7 +475,15 @@ export function AdminPage() {
     setLoading(true); setError('');
     try {
       if (activeTab === 'users') setUsers(await getUsers());
-      else setModels(await getModels());
+      else {
+        const fetched = await getModels();
+        setModels(
+          fetched.map((item) => ({
+            ...item,
+            api_key_refs: Array.isArray(item.api_key_refs) ? item.api_key_refs : [],
+          }))
+        );
+      }
     } catch (err) {
       if (err instanceof Error) {
         if (err.message.includes('403')) setError('관리자 권한이 필요합니다.');
@@ -492,6 +519,7 @@ export function AdminPage() {
       responses_create_options: JSON.stringify(model.responses_create_options, null, 2),
       api_key: '', api_keys: [], use_multi_keys: false,
       append_api_keys: [],
+      remove_api_key_ids: [],
       webhook_secret: '',
       clear_api_key: false, clear_webhook_secret: false,
       is_active: model.is_active, is_default: model.is_default,
@@ -530,6 +558,11 @@ export function AdminPage() {
         else if (hasSingleKey) data.api_key = modelForm.api_key.trim();
         const appendKeys = modelForm.append_api_keys.map((k) => k.trim()).filter(Boolean);
         if (appendKeys.length > 0) data.append_api_keys = appendKeys;
+        const removeIds = modelForm.remove_api_key_ids.map((item) => item.trim()).filter(Boolean);
+        const isReplacingApiKeys = modelForm.clear_api_key || hasMultiKeys || hasSingleKey;
+        if (!isReplacingApiKeys && removeIds.length > 0) {
+          data.remove_api_key_ids = removeIds;
+        }
         if (modelForm.webhook_secret) data.webhook_secret = modelForm.webhook_secret;
         await updateModel(editingModel, data);
       } else {
@@ -574,6 +607,13 @@ export function AdminPage() {
   };
 
   const updateForm = (patch: Partial<ModelForm>) => setModelForm((f) => ({ ...f, ...patch }));
+  const toggleRemoveApiKeyId = (keyId: string) => {
+    updateForm({
+      remove_api_key_ids: modelForm.remove_api_key_ids.includes(keyId)
+        ? modelForm.remove_api_key_ids.filter((item) => item !== keyId)
+        : [...modelForm.remove_api_key_ids, keyId],
+    });
+  };
 
   // ─── Nav items ─────────────────────────────────────────────────────────────
   const navItems: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -1043,9 +1083,47 @@ export function AdminPage() {
 
                     {editingModel && editingModelData?.has_api_key && (
                       <label className="flex items-center gap-2 mt-1.5 cursor-pointer">
-                        <input type="checkbox" checked={modelForm.clear_api_key} onChange={(e) => updateForm({ clear_api_key: e.target.checked })} className="rounded accent-red-500" />
+                        <input
+                          type="checkbox"
+                          checked={modelForm.clear_api_key}
+                          onChange={(e) => updateForm({
+                            clear_api_key: e.target.checked,
+                            remove_api_key_ids: e.target.checked ? [] : modelForm.remove_api_key_ids,
+                          })}
+                          className="rounded accent-red-500"
+                        />
                         <span className="text-[10px] text-red-500">API Key 전체 삭제</span>
                       </label>
+                    )}
+                    {editingModel && (editingModelData?.api_key_refs.length ?? 0) > 0 && (
+                      <div className="mt-2.5 space-y-1.5">
+                        <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">저장된 키 (UUID 기반 삭제)</p>
+                        <div className="space-y-1">
+                          {(editingModelData?.api_key_refs ?? []).map((ref) => {
+                            const markedForRemoval = modelForm.remove_api_key_ids.includes(ref.key_id);
+                            return (
+                              <button
+                                key={ref.key_id}
+                                type="button"
+                                onClick={() => toggleRemoveApiKeyId(ref.key_id)}
+                                disabled={modelForm.clear_api_key}
+                                className={`w-full flex items-center justify-between gap-2 rounded-lg border px-2 py-1.5 text-left transition-colors ${
+                                  markedForRemoval
+                                    ? 'border-red-200 bg-red-50 text-red-700'
+                                    : 'border-gray-200 bg-gray-50 text-gray-700 hover:border-gray-300'
+                                } ${modelForm.clear_api_key ? 'opacity-50 cursor-not-allowed' : ''}`}
+                              >
+                                <span className="text-[10px] font-mono">{ref.masked_key}</span>
+                                <span className="text-[10px] font-mono text-gray-400 truncate max-w-[170px]">{ref.key_id}</span>
+                                <span className="text-[10px] flex-shrink-0">{markedForRemoval ? '삭제 예정' : '유지'}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                        {modelForm.remove_api_key_ids.length > 0 && !modelForm.clear_api_key && (
+                          <p className="text-[10px] text-red-500">{modelForm.remove_api_key_ids.length}개 키 삭제 예정</p>
+                        )}
+                      </div>
                     )}
 
                     {/* 기존 키에 추가 (append) — 수정 모드 전용 */}
