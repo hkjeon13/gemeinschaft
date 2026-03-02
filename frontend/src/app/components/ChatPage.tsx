@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router';
+import { createPortal } from 'react-dom';
 import { marked } from 'marked';
 import '../../styles/markdown.css';
 import { LoginModal } from './LoginModal';
@@ -638,6 +639,7 @@ function UserMenuButton({ username, onLogout }: { username: string; onLogout: ()
   const [showDefaultModel, setShowDefaultModel] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const canPortal = typeof document !== 'undefined' && !!document.body;
 
   useEffect(() => {
     function outside(e: MouseEvent) {
@@ -702,8 +704,14 @@ function UserMenuButton({ username, onLogout }: { username: string; onLogout: ()
         )}
       </div>
 
-      {showDefaultModel && <DefaultModelModal onClose={() => setShowDefaultModel(false)} />}
-      {showProfile && <ProfileModal username={username} onClose={() => setShowProfile(false)} />}
+      {showDefaultModel && canPortal && createPortal(
+        <DefaultModelModal onClose={() => setShowDefaultModel(false)} />,
+        document.body
+      )}
+      {showProfile && canPortal && createPortal(
+        <ProfileModal username={username} onClose={() => setShowProfile(false)} />,
+        document.body
+      )}
     </>
   );
 }
