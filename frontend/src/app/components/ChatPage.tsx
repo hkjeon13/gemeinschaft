@@ -18,7 +18,6 @@ import {
   getConversationRoomModels,
   addConversationRoomModel,
   removeConversationRoomModel,
-  getModels,
   continueConversation,
   type ConversationModelOption,
   type ConversationRoomModel,
@@ -312,8 +311,19 @@ function ManageModelsModal({
 
   useEffect(() => {
     setLoadingAvail(true);
-    getModels()
-      .then((list) => setAvailableModels(list.filter((m) => m.is_active)))
+    getConversationModelList()
+      .then((list) =>
+        setAvailableModels(
+          list.map((m) => ({
+            model_id: m.model_id,
+            provider: m.provider,
+            model: m.model,
+            display_name: m.display_name,
+            // /conversation/model/list 는 이미 활성 모델만 반환
+            is_active: true,
+          }))
+        )
+      )
       .catch(console.error)
       .finally(() => setLoadingAvail(false));
   }, [conversationId]);
