@@ -252,6 +252,13 @@ export async function updateUserRole(username: string, role: string) {
   });
 }
 
+// 사용자 삭제
+export async function deleteUser(username: string) {
+  return apiRequest(`/admin/users/${username}`, {
+    method: 'DELETE',
+  });
+}
+
 // 로그아웃
 export async function logout() {
   return apiRequest('/auth/logout', {

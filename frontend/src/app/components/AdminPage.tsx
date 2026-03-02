@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router';
 import {
   getUsers,
   updateUserRole,
+  deleteUser,
   logout,
   getModels,
   createModel,
@@ -196,14 +197,17 @@ function UserDetailPopup({
   user,
   onClose,
   onRoleSaved,
+  onDeleted,
 }: {
   user: User;
   onClose: () => void;
   onRoleSaved: () => void;
+  onDeleted: () => void;
 }) {
   const [editingRole, setEditingRole] = useState(false);
   const [selectedRole, setSelectedRole] = useState(user.role);
   const [saving, setSaving] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   const handleSave = async () => {
     setSaving(true);
@@ -218,6 +222,25 @@ function UserDetailPopup({
       }
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (saving || deleting) return;
+    if (!confirm(`사용자 "${user.username}"를 삭제하시겠습니까?`)) return;
+    setDeleting(true);
+    try {
+      await deleteUser(user.username);
+      onDeleted();
+      onClose();
+    } catch (err) {
+      if (err instanceof Error) {
+        if (err.message.includes('400')) alert('마지막 관리자 사용자는 삭제할 수 없습니다.');
+        else if (err.message.includes('404')) alert('이미 삭제된 사용자입니다.');
+        else alert('사용자 삭제 중 오류가 발생했습니다.');
+      }
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -296,6 +319,17 @@ function UserDetailPopup({
                   ))
               }
             </div>
+          </div>
+
+          {/* 삭제 */}
+          <div className="pt-2 border-t border-gray-100">
+            <button
+              onClick={handleDelete}
+              disabled={saving || deleting}
+              className="w-full px-3 py-2 rounded-lg text-xs text-red-600 bg-red-50 hover:bg-red-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {deleting ? '삭제 중...' : '사용자 삭제'}
+            </button>
           </div>
         </div>
       </div>
@@ -449,6 +483,7 @@ export function AdminPage() {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<Tab>('users');
   const [loading, setLoading] = useState(true);
+  const [loggingOut, setLoggingOut] = useState(false);
   const [error, setError] = useState('');
   const [showLoginModal, setShowLoginModal] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -498,8 +533,17 @@ export function AdminPage() {
   };
 
   const handleLogout = async () => {
-    try { await logout(); } catch { /* ignore */ }
-    navigate('/chat');
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await logout();
+      // 인증 쿠키 기반 세션 상태를 확실히 반영하기 위해 전체 리로드
+      window.location.replace('/chat');
+    } catch (err) {
+      console.error('Logout failed:', err);
+      alert('로그아웃 요청에 실패했습니다. 잠시 후 다시 시도해주세요.');
+      setLoggingOut(false);
+    }
   };
 
   const handleNewModel = () => {
@@ -712,12 +756,19 @@ export function AdminPage() {
             <span className="text-xs truncate flex-1 font-medium text-gray-500">관리자</span>
             <button
               onClick={handleLogout}
+              disabled={loggingOut}
               title="로그아웃"
-              className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+              className="w-7 h-7 flex items-center justify-center rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
-                <path fillRule="evenodd" d="M2 2.75A.75.75 0 0 1 2.75 2h6a.75.75 0 0 1 0 1.5h-6v9h6a.75.75 0 0 1 0 1.5h-6A.75.75 0 0 1 2 13.25V2.75Zm10.28 3.47a.75.75 0 0 1 0 1.06l-1.5 1.5a.75.75 0 0 1-1.06-1.06l.22-.22H6.75a.75.75 0 0 1 0-1.5h3.19l-.22-.22a.75.75 0 1 1 1.06-1.06l1.5 1.5Z" clipRule="evenodd" />
-              </svg>
+              {loggingOut ? (
+                <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+                </svg>
+              ) : (
+                <svg viewBox="0 0 16 16" fill="currentColor" className="w-3.5 h-3.5">
+                  <path fillRule="evenodd" d="M2 2.75A.75.75 0 0 1 2.75 2h6a.75.75 0 0 1 0 1.5h-6v9h6a.75.75 0 0 1 0 1.5h-6A.75.75 0 0 1 2 13.25V2.75Zm10.28 3.47a.75.75 0 0 1 0 1.06l-1.5 1.5a.75.75 0 0 1-1.06-1.06l.22-.22H6.75a.75.75 0 0 1 0-1.5h3.19l-.22-.22a.75.75 0 1 1 1.06-1.06l1.5 1.5Z" clipRule="evenodd" />
+                </svg>
+              )}
             </button>
           </div>
         </div>
@@ -858,6 +909,7 @@ export function AdminPage() {
           user={selectedUser}
           onClose={() => setSelectedUser(null)}
           onRoleSaved={loadData}
+          onDeleted={loadData}
         />
       )}
 
