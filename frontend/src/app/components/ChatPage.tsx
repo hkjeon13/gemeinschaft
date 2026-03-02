@@ -1311,11 +1311,13 @@ export function ChatPage() {
   const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
   const [editingTitleValue, setEditingTitleValue] = useState('');
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
-  const [isContinuing, setIsContinuing] = useState(false);
+  const [continuingConversationId, setContinuingConversationId] = useState<string | null>(null);
   const [showContinueModal, setShowContinueModal] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showLoginModal, setShowLoginModal] = useState(false);
   const currentUserRef = useRef('');
+  const selectedConversationIdRef = useRef<string | null>(null);
+  const continuingConversationIdRef = useRef<string | null>(null);
   const continueRunningRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1325,6 +1327,11 @@ export function ChatPage() {
   useEffect(() => { scrollToBottom(); }, [currentConversation?.messages, sending]);
   useEffect(() => { loadInitialData(); }, []);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+  useEffect(() => { selectedConversationIdRef.current = selectedConversationId; }, [selectedConversationId]);
+  useEffect(() => { continuingConversationIdRef.current = continuingConversationId; }, [continuingConversationId]);
+  useEffect(() => () => {
+    continueRunningRef.current = false;
+  }, []);
   useEffect(() => {
     const handler = () => {
       // 비로그인 초기 진입에서는 자동으로 모달을 띄우지 않는다.
@@ -1362,11 +1369,6 @@ export function ChatPage() {
   };
 
   const handleSelectConversation = async (id: string) => {
-    // 다른 대화로 전환 시 연속 대화 중단
-    if (isContinuing) {
-      continueRunningRef.current = false;
-      setIsContinuing(false);
-    }
     setSidebarOpen(false); // 모바일: 대화 선택 시 사이드바 닫기
     setSelectedConversationId(id);
     setCurrentConversation(null); // 이전 conv-... ID 잔류로 isNewConversation 오작동 방지
@@ -1412,6 +1414,10 @@ export function ChatPage() {
     setDeletingId(convId);
     try {
       await hideConversation(convId);
+      if (continueRunningRef.current && continuingConversationIdRef.current === convId) {
+        continueRunningRef.current = false;
+        setContinuingConversationId(null);
+      }
       setConversations((prev) => prev.filter((c) => c.conversation_id !== convId));
       if (selectedConversationId === convId) {
         setSelectedConversationId(null);
@@ -1518,6 +1524,8 @@ export function ChatPage() {
 
   const handleLogout = async () => {
     try { await logout(); } catch { /* ignore */ }
+    continueRunningRef.current = false;
+    setContinuingConversationId(null);
     // 로그아웃 후에는 채팅 화면만 유지하고, 채팅 액션 시 로그인 유도
     setCurrentUser('');
     setCurrentUserName('');
@@ -1539,48 +1547,59 @@ export function ChatPage() {
   const handleStartContinue = async (settings: ContinueSettings) => {
     if (!selectedConversationId) return;
     const convId = selectedConversationId;
+    if (continueRunningRef.current && continuingConversationIdRef.current && continuingConversationIdRef.current !== convId) {
+      alert('다른 대화에서 연속 대화가 진행 중입니다. 해당 대화로 이동해 중지 후 다시 시도해주세요.');
+      return;
+    }
     continueRunningRef.current = true;
-    setIsContinuing(true);
+    setContinuingConversationId(convId);
     setShowContinueModal(false);
 
     const loop = async () => {
-      while (continueRunningRef.current) {
+      while (continueRunningRef.current && continuingConversationIdRef.current === convId) {
         try {
           const updated = await continueConversation(convId, {
             min_interval_seconds: settings.minInterval,
             max_interval_seconds: settings.maxInterval,
             max_turns: settings.maxTurns,
           });
-          if (!continueRunningRef.current) break;
-          setCurrentConversation(updated as Conversation);
+          if (!continueRunningRef.current || continuingConversationIdRef.current !== convId) break;
+          if (selectedConversationIdRef.current === convId) {
+            setCurrentConversation(updated as Conversation);
+          }
           // 대화 목록 조용히 갱신
           try {
             setConversations(await getConversationList());
           } catch { /* ignore */ }
         } catch (err) {
-          continueRunningRef.current = false;
-          setIsContinuing(false);
-          if (err instanceof Error && err.message.includes('409')) {
-            // max_turns 도달 — 정상 종료
-            console.log('[Continue] max_turns reached, stopping loop');
-          } else {
-            console.error('[Continue] loop error:', err);
-            const msg = err instanceof Error ? err.message : String(err);
-            alert(`연속 대화 오류: ${msg}`);
+          if (continuingConversationIdRef.current === convId) {
+            continueRunningRef.current = false;
+            setContinuingConversationId(null);
+            if (err instanceof Error && err.message.includes('409')) {
+              // max_turns 도달 — 정상 종료
+              console.log('[Continue] max_turns reached, stopping loop');
+            } else {
+              console.error('[Continue] loop error:', err);
+              const msg = err instanceof Error ? err.message : String(err);
+              alert(`연속 대화 오류: ${msg}`);
+            }
           }
           return;
         }
       }
-      continueRunningRef.current = false;
-      setIsContinuing(false);
+      if (continuingConversationIdRef.current === convId) {
+        continueRunningRef.current = false;
+        setContinuingConversationId(null);
+      }
     };
 
     loop();
   };
 
   const handleStopContinue = () => {
+    if (!selectedConversationId || continuingConversationIdRef.current !== selectedConversationId) return;
     continueRunningRef.current = false;
-    setIsContinuing(false);
+    setContinuingConversationId(null);
   };
 
   const roomModelImageMap = new Map(
@@ -1595,6 +1614,8 @@ export function ChatPage() {
   // 타이핑 인디케이터: pendingModel(랜덤 선택된 모델) 우선, 없으면 마지막 대화 모델
   const typingModel = pendingModel ?? (conversationModels.length > 0 ? conversationModels[conversationModels.length - 1] : null);
   const selectedConv = conversations.find((c) => c.conversation_id === selectedConversationId);
+  const isSelectedConversationContinuing =
+    !!selectedConversationId && continuingConversationId === selectedConversationId;
 
   if (loading) {
     return (
@@ -1850,7 +1871,7 @@ export function ChatPage() {
               isNewConversation={currentConversation.messages.length === 0}
               onRoomModelsChange={setRoomModels}
               onDelete={() => handleHideConversation(null, currentConversation.conversation_id)}
-              isContinuing={isContinuing}
+              isContinuing={isSelectedConversationContinuing}
               onOpenContinueSettings={() => setShowContinueModal(true)}
               onStopContinue={handleStopContinue}
               onMenuToggle={() => setSidebarOpen(true)}
