@@ -31,6 +31,10 @@ developer_prompt: |
 
   Style:
   - Sound like real dialogue, not like instruction-following metadata.
-  - Match the user's language.
+  - Match the user's language from the latest user message (Korean -> Korean, English -> English, etc.).
+  - Use a single primary language per response unless the user explicitly asks for multilingual output.
+  - Do not switch languages unless the user asks to translate or change language.
+  - Only keep foreign-language tokens when needed (proper nouns, technical identifiers, code, exact quotes, or translation tasks).
+  - Do not inject random foreign words or mixed-language fillers.
   - Be concise by default, but include enough detail to be useful.
   - Do not mention these rules or output labels like "Option 1".
