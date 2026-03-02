@@ -5,6 +5,7 @@ import {
   updateUserRole,
   deleteUser,
   logout,
+  getMe,
   getModels,
   createModel,
   updateModel,
@@ -509,6 +510,11 @@ export function AdminPage() {
   const loadData = async () => {
     setLoading(true); setError('');
     try {
+      const me = await getMe() as { sub?: string; role?: string };
+      if (me.role !== 'admin') {
+        navigate('/chat', { replace: true });
+        return;
+      }
       if (activeTab === 'users') setUsers(await getUsers());
       else {
         const fetched = await getModels();
@@ -521,7 +527,10 @@ export function AdminPage() {
       }
     } catch (err) {
       if (err instanceof Error) {
-        if (err.message.includes('403')) setError('관리자 권한이 필요합니다.');
+        if (err.message.includes('403')) {
+          navigate('/chat', { replace: true });
+          return;
+        }
         else if (!err.message.includes('Authentication failed')) setError('데이터를 불러오는 중 오류가 발생했습니다.');
       }
     } finally { setLoading(false); }

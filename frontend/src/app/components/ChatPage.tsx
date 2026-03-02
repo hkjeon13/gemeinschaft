@@ -936,6 +936,7 @@ export function ChatPage() {
   const navigate = useNavigate();
   const isMobile = useIsMobile();
   const [currentUser, setCurrentUser] = useState<string>('');
+  const [currentUserRole, setCurrentUserRole] = useState<string>('');
   const [conversations, setConversations] = useState<ConversationListItem[]>([]);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [currentConversation, setCurrentConversation] = useState<Conversation | null>(null);
@@ -976,9 +977,11 @@ export function ChatPage() {
     try {
       const meData = await getMe() as { sub: string; role?: string };
       setCurrentUser(meData.sub);
+      setCurrentUserRole(meData.role ?? '');
       setConversations(await getConversationList());
     } catch {
       setCurrentUser('');
+      setCurrentUserRole('');
       setConversations([]);
       setCurrentConversation(null);
       setSelectedConversationId(null);
@@ -1150,6 +1153,7 @@ export function ChatPage() {
     try { await logout(); } catch { /* ignore */ }
     // 로그아웃 후에는 채팅 화면만 유지하고, 채팅 액션 시 로그인 유도
     setCurrentUser('');
+    setCurrentUserRole('');
     setConversations([]);
     setCurrentConversation(null);
     setSelectedConversationId(null);
@@ -1399,7 +1403,7 @@ export function ChatPage() {
         {/* 하단 유저 정보 */}
         <div className="px-3 py-3 border-t border-gray-200 space-y-2">
           {/* Admin 버튼 */}
-          {currentUser && (
+          {currentUser && currentUserRole === 'admin' && (
             <button
               onClick={() => { setSidebarOpen(false); navigate('/admin'); }}
               className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-medium text-indigo-600 hover:bg-indigo-50 transition-colors"
