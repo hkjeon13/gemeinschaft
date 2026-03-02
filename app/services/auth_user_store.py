@@ -212,7 +212,7 @@ class PostgresAuthUserStore(AuthUserStore):
             )
 
     def init_schema(self) -> None:
-        ddl = """
+        create_table_sql = """
         CREATE TABLE IF NOT EXISTS auth_users (
             username TEXT PRIMARY KEY,
             password_hash TEXT NOT NULL,
@@ -228,12 +228,6 @@ class PostgresAuthUserStore(AuthUserStore):
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_unique
-            ON auth_users (email)
-            WHERE email IS NOT NULL;
-        CREATE INDEX IF NOT EXISTS idx_auth_users_email_verification_token_hash
-            ON auth_users (email_verification_token_hash)
-            WHERE email_verification_token_hash IS NOT NULL;
         """
         migration_sql = """
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT '';
@@ -242,6 +236,8 @@ class PostgresAuthUserStore(AuthUserStore):
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verification_token_hash TEXT;
         ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS email_verification_expires_at TIMESTAMPTZ;
+        """
+        index_sql = """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_email_unique
             ON auth_users (email)
             WHERE email IS NOT NULL;
@@ -251,8 +247,9 @@ class PostgresAuthUserStore(AuthUserStore):
         """
         with self._connect() as conn:
             with conn.cursor() as cur:
-                cur.execute(ddl)
+                cur.execute(create_table_sql)
                 cur.execute(migration_sql)
+                cur.execute(index_sql)
             conn.commit()
 
     def count_users(self) -> int:
