@@ -1,7 +1,8 @@
 from typing import Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import RedirectResponse
 
 from app.schemas.auth import (
     AuthSessionResponseSchema,
@@ -48,6 +49,19 @@ def _session_response(token_pair: dict, csrf_token: str) -> AuthSessionResponseS
         refresh_expires_in=token_pair["refresh_expires_in"],
         csrf_token=csrf_token,
     )
+
+
+def _verify_result_redirect_url(result: str, message: str) -> str:
+    base = "/email-verified"
+    parsed = urlsplit(base)
+    query_items = parse_qsl(parsed.query, keep_blank_values=True)
+    query_items.extend(
+        [
+            ("result", result),
+            ("message", message),
+        ]
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query_items), parsed.fragment))
 
 
 @auth_router.post("/login", response_model=AuthSessionResponseSchema)
@@ -104,44 +118,21 @@ async def verify_email(payload: VerifyEmailRequestSchema):
     return VerifyEmailResponseSchema(message="이메일 인증이 완료되었습니다. 로그인할 수 있습니다.")
 
 
-@auth_router.get("/verify-email", response_class=HTMLResponse, name="verify_email_get")
+@auth_router.get("/verify-email", name="verify_email_get")
 async def verify_email_get(token: str):
     try:
         verify_email_token(token)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, str) else "이메일 인증에 실패했습니다."
-        html = f"""
-<!doctype html>
-<html lang="ko">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>이메일 인증 실패</title>
-  </head>
-  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px;">
-    <h1 style="font-size: 22px; margin: 0 0 8px 0;">이메일 인증 실패</h1>
-    <p style="color: #374151;">{detail}</p>
-    <p style="color: #6b7280;">다시 회원가입하거나 인증 메일 재전송을 요청해 주세요.</p>
-  </body>
-</html>
-"""
-        return HTMLResponse(content=html, status_code=exc.status_code)
+        return RedirectResponse(
+            url=_verify_result_redirect_url("error", detail),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
 
-    html = """
-<!doctype html>
-<html lang="ko">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>이메일 인증 완료</title>
-  </head>
-  <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 40px;">
-    <h1 style="font-size: 22px; margin: 0 0 8px 0;">이메일 인증 완료</h1>
-    <p style="color: #374151;">이제 로그인해서 서비스를 이용할 수 있습니다.</p>
-  </body>
-</html>
-"""
-    return HTMLResponse(content=html, status_code=status.HTTP_200_OK)
+    return RedirectResponse(
+        url=_verify_result_redirect_url("success", "이메일 인증이 완료되었습니다. 로그인해서 이용해 주세요."),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
 
 
 @auth_router.post("/resend-verification", response_model=ResendVerificationResponseSchema)
