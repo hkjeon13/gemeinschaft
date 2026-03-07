@@ -539,6 +539,48 @@ def _content_to_preview_text(content: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _today_metadata_json() -> str:
+    today = datetime.now(timezone.utc).date().isoformat()
+    return json.dumps({"today": today}, ensure_ascii=False)
+
+
+def _append_today_metadata_to_latest_user_message(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+
+    metadata = _today_metadata_json()
+    for item in reversed(messages):
+        role = str(item.get("role", "")).strip().lower()
+        if role != "user":
+            continue
+
+        content = item.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+            if not text:
+                continue
+            item["content"] = f"{text}\n\n{metadata}"
+            return messages
+
+        if isinstance(content, list):
+            for block in reversed(content):
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type", "")).strip().lower()
+                if block_type not in _TEXT_CONTENT_TYPES:
+                    continue
+                text = str(block.get("text", "")).strip()
+                if not text:
+                    continue
+                block["text"] = f"{text}\n\n{metadata}"
+                return messages
+
+            content.append({"type": "input_text", "text": metadata})
+            return messages
+
+    return messages
+
+
 def _conversation_to_openai_messages(
     conversation: dict[str, Any],
     *,
@@ -876,6 +918,7 @@ async def _prepare_continue_generation(
         conversation,
         selected_model_id=selected_model.model_id,
     )
+    messages = _append_today_metadata_to_latest_user_message(messages)
     messages = _prepend_developer_prompt(
         messages,
         selected_model_id=selected_model.model_id,
@@ -1294,6 +1337,7 @@ async def create_dialogue(
         conversation,
         selected_model_id=selected_model.model_id,
     )
+    messages = _append_today_metadata_to_latest_user_message(messages)
     messages = _prepend_developer_prompt(
         messages,
         selected_model_id=selected_model.model_id,
